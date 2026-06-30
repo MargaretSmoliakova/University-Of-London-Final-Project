@@ -54,11 +54,14 @@ UID_COMPONENT_PATTERN = re.compile(r"^\d+(?:\.\d+){3,}$")
 class Config:
     dataset_root: Path
     output_dir: Path
+    models: tuple[str, ...] = ("baseline", "regularized")
     lesion_type: str = "both"
     image_size: int = 224
     batch_size: int = 16
     seed: int = 42
     max_epochs_baseline: int = 30
+    max_epochs_regularized: int = 40
+    early_stopping_patience: int = 5
     include_benign_without_callback: bool = False
 
 @dataclass(frozen=True)
@@ -76,24 +79,30 @@ class DicomInfo:
         return self.rows * self.columns
 
 def parse_args() -> Config:
-    parser = argparse.ArgumentParser(description="Refactored CBIS-DDSM baseline experiment")
+    parser = argparse.ArgumentParser(description="CBIS-DDSM baseline and regularized CNN experiments")
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--models", nargs="+", choices=("baseline", "regularized"), default=("baseline", "regularized"))
     parser.add_argument("--lesion-type", choices=("both", "mass", "calcification"), default="both")
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-epochs-baseline", type=int, default=30)
+    parser.add_argument("--max-epochs-regularized", type=int, default=40)
+    parser.add_argument("--early-stopping-patience", type=int, default=5)
     parser.add_argument("--include-benign-without-callback", action="store_true")
     args = parser.parse_args()
     return Config(
         dataset_root=args.dataset_root.resolve(),
         output_dir=args.output_dir.resolve(),
+        models=tuple(args.models),
         lesion_type=args.lesion_type,
         image_size=args.image_size,
         batch_size=args.batch_size,
         seed=args.seed,
         max_epochs_baseline=args.max_epochs_baseline,
+        max_epochs_regularized=args.max_epochs_regularized,
+        early_stopping_patience=args.early_stopping_patience,
         include_benign_without_callback=args.include_benign_without_callback,
     )
 
@@ -463,6 +472,18 @@ def make_dataset(
         )
     return dataset.batch(config.batch_size).prefetch(tf.data.AUTOTUNE)
 
+def augmentation_layers() -> tf.keras.Sequential:
+
+    return tf.keras.Sequential(
+        [
+            tf.keras.layers.RandomFlip("horizontal"),
+            tf.keras.layers.RandomRotation(0.025, fill_mode="reflect"),
+            tf.keras.layers.RandomTranslation(0.04, 0.04, fill_mode="reflect"),
+            tf.keras.layers.RandomZoom(0.08, 0.08, fill_mode="reflect"),
+            tf.keras.layers.RandomContrast(0.10),
+        ],
+        name="training_only_augmentation",
+    )
 
 def compile_binary_model(model: tf.keras.Model, learning_rate: float) -> None:
     model.compile(
@@ -470,18 +491,50 @@ def compile_binary_model(model: tf.keras.Model, learning_rate: float) -> None:
         loss=tf.keras.losses.BinaryCrossentropy(),
     )
 
+def build_scratch_cnn(config: Config, regularized: bool) -> tf.keras.Model:
+    inputs = tf.keras.Input(
+        (config.image_size, config.image_size, 3), name="image_0_255"
+    )
+    x = inputs
+    if regularized:
+        x = augmentation_layers()(x)
+    x = tf.keras.layers.Rescaling(1.0 / 255.0, name="cnn_rescale_0_1")(x)
+    l2 = tf.keras.regularizers.l2(1e-4) if regularized else None
 
-def build_baseline_cnn(config: Config) -> tf.keras.Model:
-    inputs = tf.keras.Input((config.image_size, config.image_size, 3), name="image_0_255")
-    x = tf.keras.layers.Rescaling(1.0 / 255.0)(inputs)
-    for filters in (32, 64, 128, 256):
-        x = tf.keras.layers.Conv2D(filters, 3, padding="same", activation="relu")(x)
-        x = tf.keras.layers.MaxPooling2D()(x)
-    x = tf.keras.layers.GlobalAveragePooling2D()(x)
-    x = tf.keras.layers.Dense(128, activation="relu")(x)
-    outputs = tf.keras.layers.Dense(1, activation="sigmoid")(x)
-    model = tf.keras.Model(inputs, outputs, name="baseline_cnn")
-    compile_binary_model(model, 1e-3)
+    for block_index, filters in enumerate((32, 64, 128, 256), start=1):
+        x = tf.keras.layers.Conv2D(
+            filters,
+            3,
+            padding="same",
+            use_bias=not regularized,
+            kernel_initializer="he_normal",
+            kernel_regularizer=l2,
+            name=f"block{block_index}_conv",
+        )(x)
+        if regularized:
+            x = tf.keras.layers.BatchNormalization(name=f"block{block_index}_bn")(x)
+        x = tf.keras.layers.Activation("relu", name=f"block{block_index}_relu")(x)
+        x = tf.keras.layers.MaxPooling2D(name=f"block{block_index}_pool")(x)
+        if regularized and block_index >= 3:
+            x = tf.keras.layers.SpatialDropout2D(
+                0.10, name=f"block{block_index}_drop"
+            )(x)
+
+    x = tf.keras.layers.GlobalAveragePooling2D(name="global_average_pool")(x)
+    x = tf.keras.layers.Dense(
+        128, activation="relu", kernel_regularizer=l2, name="classification_features"
+    )(x)
+    if regularized:
+        x = tf.keras.layers.Dropout(0.40, name="head_dropout")(x)
+    outputs = tf.keras.layers.Dense(
+        1, activation="sigmoid", name="malignancy_probability"
+    )(x)
+    model = tf.keras.Model(
+        inputs,
+        outputs,
+        name="regularized_cnn" if regularized else "baseline_cnn",
+    )
+    compile_binary_model(model, learning_rate=3e-4 if regularized else 1e-3)
     return model
 
 def balanced_class_weights(metadata: pd.DataFrame) -> dict[int, float]:
@@ -493,7 +546,34 @@ def balanced_class_weights(metadata: pd.DataFrame) -> dict[int, float]:
     total = float(counts.sum())
     return {int(label): total / (2.0 * float(count)) for label, count in counts.items()}
 
-def run_experiment(config: Config) -> None:
+def callbacks_for_stage(config: Config, stage_dir: Path) -> list[tf.keras.callbacks.Callback]:
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    return [
+        tf.keras.callbacks.ModelCheckpoint(
+            stage_dir / "best.weights.h5",
+            monitor="val_loss",
+            mode="min",
+            save_best_only=True,
+            save_weights_only=True,
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            mode="min",
+            patience=config.early_stopping_patience,
+            restore_best_weights=True,
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            mode="min",
+            factor=0.3,
+            patience=max(2, config.early_stopping_patience // 2),
+            min_lr=1e-7,
+        ),
+        tf.keras.callbacks.TerminateOnNaN(),
+    ]
+
+
+def run_experiments(config: Config) -> None:
     configure_runtime(config)
     write_json(config.output_dir / "config.json", asdict(config))
 
@@ -501,13 +581,7 @@ def run_experiment(config: Config) -> None:
     resolver = ImageResolver(config.dataset_root)
     train_metadata, unresolved_train = resolve_metadata_images(raw_train, resolver)
     test_metadata, unresolved_test = resolve_metadata_images(raw_test, resolver)
-    audit_dataset(
-        train_metadata,
-        test_metadata,
-        unresolved_train,
-        unresolved_test,
-        config.output_dir,
-    )
+    audit_dataset(train_metadata, test_metadata, unresolved_train, unresolved_test, config.output_dir)
 
     splitter = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=config.seed)
     train_index, validation_index = next(
@@ -516,16 +590,25 @@ def run_experiment(config: Config) -> None:
     fold_train = train_metadata.iloc[train_index].reset_index(drop=True)
     fold_validation = train_metadata.iloc[validation_index].reset_index(drop=True)
 
-    model = build_baseline_cnn(config)
-    model.fit(
-        make_dataset(fold_train, config, training=True),
-        validation_data=make_dataset(fold_validation, config, training=False),
-        epochs=config.max_epochs_baseline,
-        class_weight=balanced_class_weights(fold_train),
-        verbose=2,
-    )
-    model.save(config.output_dir / "baseline_model.keras")
+    for variant in config.models:
+        tf.keras.backend.clear_session()
+        model = build_scratch_cnn(config, regularized=(variant == "regularized"))
+        epochs = (
+            config.max_epochs_regularized
+            if variant == "regularized"
+            else config.max_epochs_baseline
+        )
+        variant_dir = config.output_dir / variant
+        model.fit(
+            make_dataset(fold_train, config, training=True),
+            validation_data=make_dataset(fold_validation, config, training=False),
+            epochs=epochs,
+            class_weight=balanced_class_weights(fold_train),
+            callbacks=callbacks_for_stage(config, variant_dir),
+            verbose=2,
+        )
+        model.save(variant_dir / "model.keras")
 
 
 if __name__ == "__main__":
-    run_experiment(parse_args())
+    run_experiments(parse_args())
