@@ -54,14 +54,17 @@ UID_COMPONENT_PATTERN = re.compile(r"^\d+(?:\.\d+){3,}$")
 class Config:
     dataset_root: Path
     output_dir: Path
-    models: tuple[str, ...] = ("baseline", "regularized")
+    models: tuple[str, ...] = ("baseline", "regularized", "transfer")
     lesion_type: str = "both"
     image_size: int = 224
     batch_size: int = 16
     seed: int = 42
     max_epochs_baseline: int = 30
     max_epochs_regularized: int = 40
+    max_epochs_transfer_head: int = 10
+    max_epochs_transfer_finetune: int = 12
     early_stopping_patience: int = 5
+    fine_tune_last_layers: int = 40
     include_benign_without_callback: bool = False
 
 @dataclass(frozen=True)
@@ -79,17 +82,20 @@ class DicomInfo:
         return self.rows * self.columns
 
 def parse_args() -> Config:
-    parser = argparse.ArgumentParser(description="CBIS-DDSM baseline and regularized CNN experiments")
+    parser = argparse.ArgumentParser(description="CBIS-DDSM three-model experiment")
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--models", nargs="+", choices=("baseline", "regularized"), default=("baseline", "regularized"))
+    parser.add_argument("--models", nargs="+", choices=("baseline", "regularized", "transfer"), default=("baseline", "regularized", "transfer"))
     parser.add_argument("--lesion-type", choices=("both", "mass", "calcification"), default="both")
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-epochs-baseline", type=int, default=30)
     parser.add_argument("--max-epochs-regularized", type=int, default=40)
+    parser.add_argument("--max-epochs-transfer-head", type=int, default=10)
+    parser.add_argument("--max-epochs-transfer-finetune", type=int, default=12)
     parser.add_argument("--early-stopping-patience", type=int, default=5)
+    parser.add_argument("--fine-tune-last-layers", type=int, default=40)
     parser.add_argument("--include-benign-without-callback", action="store_true")
     args = parser.parse_args()
     return Config(
@@ -102,7 +108,10 @@ def parse_args() -> Config:
         seed=args.seed,
         max_epochs_baseline=args.max_epochs_baseline,
         max_epochs_regularized=args.max_epochs_regularized,
+        max_epochs_transfer_head=args.max_epochs_transfer_head,
+        max_epochs_transfer_finetune=args.max_epochs_transfer_finetune,
         early_stopping_patience=args.early_stopping_patience,
+        fine_tune_last_layers=args.fine_tune_last_layers,
         include_benign_without_callback=args.include_benign_without_callback,
     )
 
@@ -537,6 +546,57 @@ def build_scratch_cnn(config: Config, regularized: bool) -> tf.keras.Model:
     compile_binary_model(model, learning_rate=3e-4 if regularized else 1e-3)
     return model
 
+def build_transfer_model(config: Config) -> tf.keras.Model:
+    inputs = tf.keras.Input(
+        (config.image_size, config.image_size, 3), name="image_0_255"
+    )
+    x = augmentation_layers()(inputs)
+
+
+    backbone = tf.keras.applications.EfficientNetB0(
+        include_top=False,
+        weights="imagenet",
+        input_shape=(config.image_size, config.image_size, 3),
+    )
+    backbone.trainable = False
+    x = backbone(x, training=False)
+    x = tf.keras.layers.GlobalAveragePooling2D(name="global_average_pool")(x)
+    x = tf.keras.layers.Dropout(0.40, name="head_dropout_1")(x)
+    x = tf.keras.layers.Dense(
+        128,
+        activation="swish",
+        kernel_regularizer=tf.keras.regularizers.l2(1e-4),
+        name="classification_features",
+    )(x)
+    x = tf.keras.layers.Dropout(0.25, name="head_dropout_2")(x)
+    outputs = tf.keras.layers.Dense(
+        1, activation="sigmoid", name="malignancy_probability"
+    )(x)
+    model = tf.keras.Model(inputs, outputs, name="efficientnetb0_transfer")
+    compile_binary_model(model, learning_rate=1e-3)
+    return model
+
+def enable_transfer_fine_tuning(model: tf.keras.Model, last_layers: int) -> None:
+    nested_models = [
+        layer
+        for layer in model.layers
+        if isinstance(layer, tf.keras.Model) and "efficientnet" in layer.name.lower()
+    ]
+    if len(nested_models) != 1:
+        raise RuntimeError(
+            "Expected one EfficientNet backbone, found "
+            f"{[layer.name for layer in nested_models]}"
+        )
+    backbone = nested_models[0]
+    backbone.trainable = True
+    cutoff = max(0, len(backbone.layers) - last_layers)
+    for index, layer in enumerate(backbone.layers):
+        layer.trainable = index >= cutoff and not isinstance(
+            layer, tf.keras.layers.BatchNormalization
+        )
+
+    compile_binary_model(model, learning_rate=1e-5)
+
 def balanced_class_weights(metadata: pd.DataFrame) -> dict[int, float]:
     counts = metadata["label"].value_counts().sort_index()
     if set(counts.index) != {0, 1}:
@@ -573,6 +633,68 @@ def callbacks_for_stage(config: Config, stage_dir: Path) -> list[tf.keras.callba
     ]
 
 
+def train_variant(
+    variant: str,
+    fold_train: pd.DataFrame,
+    fold_validation: pd.DataFrame,
+    config: Config,
+) -> tf.keras.Model:
+    train_ds = make_dataset(fold_train, config, training=True)
+    validation_ds = make_dataset(fold_validation, config, training=False)
+    class_weights = balanced_class_weights(fold_train)
+    variant_dir = config.output_dir / variant
+
+    if variant == "baseline":
+        model = build_scratch_cnn(config, regularized=False)
+        model.fit(
+            train_ds,
+            validation_data=validation_ds,
+            epochs=config.max_epochs_baseline,
+            class_weight=class_weights,
+            callbacks=callbacks_for_stage(config, variant_dir / "training"),
+            verbose=2,
+        )
+        return model
+
+    if variant == "regularized":
+        model = build_scratch_cnn(config, regularized=True)
+        model.fit(
+            train_ds,
+            validation_data=validation_ds,
+            epochs=config.max_epochs_regularized,
+            class_weight=class_weights,
+            callbacks=callbacks_for_stage(config, variant_dir / "training"),
+            verbose=2,
+        )
+        return model
+
+    if variant == "transfer":
+        model = build_transfer_model(config)
+        head_dir = variant_dir / "head_training"
+        model.fit(
+            train_ds,
+            validation_data=validation_ds,
+            epochs=config.max_epochs_transfer_head,
+            class_weight=class_weights,
+            callbacks=callbacks_for_stage(config, head_dir),
+            verbose=2,
+        )
+        model.load_weights(head_dir / "best.weights.h5")
+        enable_transfer_fine_tuning(model, config.fine_tune_last_layers)
+        fine_dir = variant_dir / "fine_tuning"
+        model.fit(
+            train_ds,
+            validation_data=validation_ds,
+            epochs=config.max_epochs_transfer_finetune,
+            class_weight=class_weights,
+            callbacks=callbacks_for_stage(config, fine_dir),
+            verbose=2,
+        )
+        return model
+
+    raise ValueError(variant)
+
+
 def run_experiments(config: Config) -> None:
     configure_runtime(config)
     write_json(config.output_dir / "config.json", asdict(config))
@@ -592,22 +714,11 @@ def run_experiments(config: Config) -> None:
 
     for variant in config.models:
         tf.keras.backend.clear_session()
-        model = build_scratch_cnn(config, regularized=(variant == "regularized"))
-        epochs = (
-            config.max_epochs_regularized
-            if variant == "regularized"
-            else config.max_epochs_baseline
-        )
-        variant_dir = config.output_dir / variant
-        model.fit(
-            make_dataset(fold_train, config, training=True),
-            validation_data=make_dataset(fold_validation, config, training=False),
-            epochs=epochs,
-            class_weight=balanced_class_weights(fold_train),
-            callbacks=callbacks_for_stage(config, variant_dir),
-            verbose=2,
-        )
-        model.save(variant_dir / "model.keras")
+        tf.keras.utils.set_random_seed(config.seed)
+        model = train_variant(variant, fold_train, fold_validation, config)
+        model_dir = config.output_dir / variant
+        model_dir.mkdir(parents=True, exist_ok=True)
+        model.save(model_dir / "model.keras")
 
 
 if __name__ == "__main__":
