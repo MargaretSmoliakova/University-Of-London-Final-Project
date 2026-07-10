@@ -58,14 +58,17 @@ class Config:
     lesion_type: str = "both"
     image_size: int = 224
     batch_size: int = 16
+    folds: int = 5
     seed: int = 42
-    max_epochs_baseline: int = 30
-    max_epochs_regularized: int = 40
-    max_epochs_transfer_head: int = 10
-    max_epochs_transfer_finetune: int = 12
-    early_stopping_patience: int = 5
+    max_epochs_baseline: int = 40
+    max_epochs_regularized: int = 50
+    max_epochs_transfer_head: int = 15
+    max_epochs_transfer_finetune: int = 20
+    early_stopping_patience: int = 7
     fine_tune_last_layers: int = 40
     include_benign_without_callback: bool = False
+    dataset_cache: str = "none"
+    audit_only: bool = False
 
 @dataclass(frozen=True)
 class DicomInfo:
@@ -82,29 +85,45 @@ class DicomInfo:
         return self.rows * self.columns
 
 def parse_args() -> Config:
-    parser = argparse.ArgumentParser(description="CBIS-DDSM three-model experiment")
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--models", nargs="+", choices=("baseline", "regularized", "transfer"), default=("baseline", "regularized", "transfer"))
     parser.add_argument("--lesion-type", choices=("both", "mass", "calcification"), default="both")
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max-epochs-baseline", type=int, default=30)
-    parser.add_argument("--max-epochs-regularized", type=int, default=40)
-    parser.add_argument("--max-epochs-transfer-head", type=int, default=10)
-    parser.add_argument("--max-epochs-transfer-finetune", type=int, default=12)
-    parser.add_argument("--early-stopping-patience", type=int, default=5)
+    parser.add_argument("--max-epochs-baseline", type=int, default=40)
+    parser.add_argument("--max-epochs-regularized", type=int, default=50)
+    parser.add_argument("--max-epochs-transfer-head", type=int, default=15)
+    parser.add_argument("--max-epochs-transfer-finetune", type=int, default=20)
+    parser.add_argument("--early-stopping-patience", type=int, default=7)
     parser.add_argument("--fine-tune-last-layers", type=int, default=40)
     parser.add_argument("--include-benign-without-callback", action="store_true")
+    parser.add_argument("--dataset-cache", choices=("none", "memory"), default="none")
+    parser.add_argument("--audit-only", action="store_true")
     args = parser.parse_args()
+
+    if args.folds < 2:
+        parser.error("--folds must be at least 2")
+
+    output_root = args.output_dir.resolve()
+    script_output_folder = Path(__file__).stem
+    versioned_output_dir = (
+        output_root
+        if output_root.name == script_output_folder
+        else output_root / script_output_folder
+    )
+
     return Config(
         dataset_root=args.dataset_root.resolve(),
-        output_dir=args.output_dir.resolve(),
+        output_dir=versioned_output_dir,
         models=tuple(args.models),
         lesion_type=args.lesion_type,
         image_size=args.image_size,
         batch_size=args.batch_size,
+        folds=args.folds,
         seed=args.seed,
         max_epochs_baseline=args.max_epochs_baseline,
         max_epochs_regularized=args.max_epochs_regularized,
@@ -113,15 +132,33 @@ def parse_args() -> Config:
         early_stopping_patience=args.early_stopping_patience,
         fine_tune_last_layers=args.fine_tune_last_layers,
         include_benign_without_callback=args.include_benign_without_callback,
+        dataset_cache=args.dataset_cache,
+        audit_only=args.audit_only,
     )
-
 
 def configure_runtime(config: Config) -> None:
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(config.output_dir / "experiment.log", encoding="utf-8"),
+        ],
+    )
+    LOGGER.info(
+        "All logs and experiment artifacts for %s are stored under %s",
+        Path(__file__).name,
+        config.output_dir,
+    )
     random.seed(config.seed)
     np.random.seed(config.seed)
     tf.keras.utils.set_random_seed(config.seed)
-
+    try:
+        tf.config.experimental.enable_op_determinism()
+        LOGGER.info("TensorFlow deterministic operations enabled")
+    except Exception as exc:
+        LOGGER.warning("Could not enable complete TensorFlow determinism: %s", exc)
 def json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -401,22 +438,6 @@ def split_summary(metadata: pd.DataFrame) -> dict[str, Any]:
         "resolution_methods": metadata["resolution_method"].value_counts().to_dict(),
     }
 
-def _numpy_load_image(path_bytes: bytes) -> np.ndarray:
-    path = path_bytes.decode("utf-8")
-    return percentile_window_to_255(read_pixel_array(path))[..., None]
-
-def load_image_tensor(
-    image_path: tf.Tensor, label: tf.Tensor, image_size: int
-) -> tuple[tf.Tensor, tf.Tensor]:
-    image = tf.numpy_function(_numpy_load_image, [image_path], tf.float32)
-    image.set_shape((None, None, 1))
-    image = tf.image.resize_with_pad(
-        image, image_size, image_size, method=tf.image.ResizeMethod.BILINEAR
-    )
-    image = tf.image.grayscale_to_rgb(image)
-    image = tf.ensure_shape(image, (image_size, image_size, 3))
-    return image, tf.cast(label, tf.float32)
-
 def audit_dataset(
     train_metadata: pd.DataFrame,
     test_metadata: pd.DataFrame,
@@ -456,6 +477,62 @@ def audit_dataset(
     return audit
 
 
+def prepare_experiment_data(config: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
+    raw_train, raw_test = load_metadata(config)
+    resolver = ImageResolver(config.dataset_root)
+    train_metadata, unresolved_train = resolve_metadata_images(raw_train, resolver)
+    test_metadata, unresolved_test = resolve_metadata_images(raw_test, resolver)
+    audit = audit_dataset(
+        train_metadata,
+        test_metadata,
+        unresolved_train,
+        unresolved_test,
+        config.output_dir,
+    )
+    LOGGER.info("Data audit passed: %s", json.dumps(audit, default=json_default))
+    return train_metadata, test_metadata
+
+def stratification_labels(metadata: pd.DataFrame) -> np.ndarray:
+    return (
+        metadata["lesion_type"].astype(str)
+        + "_label_"
+        + metadata["label"].astype(str)
+    ).to_numpy()
+
+def validate_fold_integrity(
+    train_fold: pd.DataFrame, validation_fold: pd.DataFrame, fold_number: int
+) -> None:
+    overlap = set(train_fold["patient_id"]).intersection(validation_fold["patient_id"])
+    if overlap:
+        raise RuntimeError(
+            f"Patient leakage in CV fold {fold_number}: {sorted(overlap)[:10]}"
+        )
+    if train_fold["label"].nunique() != 2 or validation_fold["label"].nunique() != 2:
+        raise RuntimeError(f"Both classes are required in CV fold {fold_number}")
+
+def make_cv_splitter(config: Config) -> StratifiedGroupKFold:
+    return StratifiedGroupKFold(
+        n_splits=config.folds,
+        shuffle=True,
+        random_state=config.seed,
+    )
+
+def _numpy_load_image(path_bytes: bytes) -> np.ndarray:
+    path = path_bytes.decode("utf-8")
+    return percentile_window_to_255(read_pixel_array(path))[..., None]
+
+def load_image_tensor(
+    image_path: tf.Tensor, label: tf.Tensor, image_size: int
+) -> tuple[tf.Tensor, tf.Tensor]:
+    image = tf.numpy_function(_numpy_load_image, [image_path], tf.float32)
+    image.set_shape((None, None, 1))
+    image = tf.image.resize_with_pad(
+        image, image_size, image_size, method=tf.image.ResizeMethod.BILINEAR
+    )
+    image = tf.image.grayscale_to_rgb(image)
+    image = tf.ensure_shape(image, (image_size, image_size, 3))
+    return image, tf.cast(label, tf.float32)
+
 def make_dataset(
     metadata: pd.DataFrame,
     config: Config,
@@ -473,6 +550,19 @@ def make_dataset(
         num_parallel_calls=tf.data.AUTOTUNE,
         deterministic=True,
     )
+
+
+    if config.dataset_cache == "memory":
+        estimated_gib = (
+            len(metadata) * config.image_size * config.image_size * 3 * 4 / (1024**3)
+        )
+        LOGGER.info(
+            "In-memory image cache enabled for %d rows "
+            "(approximately %.2f GiB once full)",
+            len(metadata),
+            estimated_gib,
+        )
+        dataset = dataset.cache()
     if training:
         dataset = dataset.shuffle(
             buffer_size=len(metadata),
@@ -606,9 +696,65 @@ def balanced_class_weights(metadata: pd.DataFrame) -> dict[int, float]:
     total = float(counts.sum())
     return {int(label): total / (2.0 * float(count)) for label, count in counts.items()}
 
-def callbacks_for_stage(config: Config, stage_dir: Path) -> list[tf.keras.callbacks.Callback]:
+def flush_python_log_handlers() -> None:
+    seen: set[int] = set()
+    for logger in (LOGGER, logging.getLogger()):
+        for handler in logger.handlers:
+            if id(handler) in seen:
+                continue
+            seen.add(id(handler))
+            handler.flush()
+            stream = getattr(handler, "stream", None)
+            if isinstance(handler, logging.FileHandler) and stream is not None:
+                try:
+                    os.fsync(stream.fileno())
+                except (AttributeError, OSError):
+                    pass
+
+class EpochTiming(tf.keras.callbacks.Callback):
+    def __init__(self, stage_name: str):
+        super().__init__()
+        self.stage_name = stage_name
+        self.started_at = 0.0
+
+    def on_epoch_begin(self, epoch: int, logs: dict[str, Any] | None = None) -> None:
+        self.started_at = time.perf_counter()
+
+    def on_epoch_end(self, epoch: int, logs: dict[str, Any] | None = None) -> None:
+        elapsed = time.perf_counter() - self.started_at
+        if logs is not None:
+            logs["epoch_seconds"] = elapsed
+        metric_text = ", ".join(
+            f"{name}={float(value):.6f}"
+            for name, value in (logs or {}).items()
+            if name != "epoch_seconds" and isinstance(value, (int, float, np.number))
+        )
+        LOGGER.info(
+            "%s epoch %d finished in %.1f seconds | %s",
+            self.stage_name,
+            epoch + 1,
+            elapsed,
+            metric_text,
+        )
+        flush_python_log_handlers()
+
+class ImmediateCSVLogger(tf.keras.callbacks.CSVLogger):
+    def on_epoch_end(self, epoch: int, logs: dict[str, Any] | None = None) -> None:
+        super().on_epoch_end(epoch, logs)
+        csv_file = getattr(self, "csv_file", None)
+        if csv_file is not None:
+            csv_file.flush()
+            try:
+                os.fsync(csv_file.fileno())
+            except (AttributeError, OSError):
+                pass
+
+def callbacks_for_stage(
+    config: Config, stage_dir: Path, stage_name: str
+) -> list[tf.keras.callbacks.Callback]:
     stage_dir.mkdir(parents=True, exist_ok=True)
     return [
+        EpochTiming(stage_name),
         tf.keras.callbacks.ModelCheckpoint(
             stage_dir / "best.weights.h5",
             monitor="val_loss",
@@ -629,96 +775,305 @@ def callbacks_for_stage(config: Config, stage_dir: Path) -> list[tf.keras.callba
             patience=max(2, config.early_stopping_patience // 2),
             min_lr=1e-7,
         ),
+        ImmediateCSVLogger(stage_dir / "history.csv"),
         tf.keras.callbacks.TerminateOnNaN(),
     ]
 
+def callbacks_for_final_stage(
+    stage_dir: Path, stage_name: str
+) -> list[tf.keras.callbacks.Callback]:
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    return [
+        EpochTiming(stage_name),
+        ImmediateCSVLogger(stage_dir / "history.csv"),
+        tf.keras.callbacks.TerminateOnNaN(),
+    ]
 
-def train_variant(
+def best_epoch_and_value(history: tf.keras.callbacks.History) -> tuple[int, float]:
+    values = np.asarray(history.history["val_loss"], dtype=float)
+    best_index = int(np.nanargmin(values))
+    return best_index + 1, float(values[best_index])
+
+def train_one_fold(
     variant: str,
-    fold_train: pd.DataFrame,
-    fold_validation: pd.DataFrame,
+    train_metadata: pd.DataFrame,
+    validation_metadata: pd.DataFrame,
+    config: Config,
+    fold_dir: Path,
+    fold_number: int,
+) -> tuple[tf.keras.Model, dict[str, Any]]:
+    tf.keras.backend.clear_session()
+    tf.keras.utils.set_random_seed(config.seed + fold_number)
+    train_dataset = make_dataset(
+        train_metadata, config, training=True, seed_offset=fold_number
+    )
+    validation_dataset = make_dataset(validation_metadata, config, training=False)
+    class_weights = balanced_class_weights(train_metadata)
+
+    if variant == "baseline":
+        stage_name = f"baseline fold {fold_number}/{config.folds} training"
+        LOGGER.info(
+            "Starting %s (maximum %d epochs)", stage_name, config.max_epochs_baseline
+        )
+        model = build_scratch_cnn(config, regularized=False)
+        history = model.fit(
+            train_dataset,
+            validation_data=validation_dataset,
+            epochs=config.max_epochs_baseline,
+            class_weight=class_weights,
+            callbacks=callbacks_for_stage(config, fold_dir / "training", stage_name),
+            verbose=2,
+        )
+        selected_epoch, selected_loss = best_epoch_and_value(history)
+        schedule = {
+            "selected_epoch": selected_epoch,
+            "selected_stage": "single_stage",
+            "validation_loss": selected_loss,
+        }
+    elif variant == "regularized":
+        stage_name = f"regularized fold {fold_number}/{config.folds} training"
+        LOGGER.info(
+            "Starting %s (maximum %d epochs)",
+            stage_name,
+            config.max_epochs_regularized,
+        )
+        model = build_scratch_cnn(config, regularized=True)
+        history = model.fit(
+            train_dataset,
+            validation_data=validation_dataset,
+            epochs=config.max_epochs_regularized,
+            class_weight=class_weights,
+            callbacks=callbacks_for_stage(config, fold_dir / "training", stage_name),
+            verbose=2,
+        )
+        selected_epoch, selected_loss = best_epoch_and_value(history)
+        schedule = {
+            "selected_epoch": selected_epoch,
+            "selected_stage": "single_stage",
+            "validation_loss": selected_loss,
+        }
+    elif variant == "transfer":
+        model = build_transfer_model(config)
+        head_dir = fold_dir / "head_training"
+        head_stage_name = f"transfer fold {fold_number}/{config.folds} head training"
+        LOGGER.info(
+            "Starting %s (maximum %d epochs)",
+            head_stage_name,
+            config.max_epochs_transfer_head,
+        )
+        head_history = model.fit(
+            train_dataset,
+            validation_data=validation_dataset,
+            epochs=config.max_epochs_transfer_head,
+            class_weight=class_weights,
+            callbacks=callbacks_for_stage(config, head_dir, head_stage_name),
+            verbose=2,
+        )
+        head_epoch, head_loss = best_epoch_and_value(head_history)
+        model.load_weights(head_dir / "best.weights.h5")
+
+        enable_transfer_fine_tuning(model, config.fine_tune_last_layers)
+        fine_dir = fold_dir / "fine_tuning"
+        fine_stage_name = f"transfer fold {fold_number}/{config.folds} fine-tuning"
+        LOGGER.info(
+            "Starting %s (maximum %d epochs)",
+            fine_stage_name,
+            config.max_epochs_transfer_finetune,
+        )
+        fine_history = model.fit(
+            train_dataset,
+            validation_data=validation_dataset,
+            epochs=config.max_epochs_transfer_finetune,
+            class_weight=class_weights,
+            callbacks=callbacks_for_stage(config, fine_dir, fine_stage_name),
+            verbose=2,
+        )
+        fine_epoch, fine_loss = best_epoch_and_value(fine_history)
+        if fine_loss <= head_loss:
+            model.load_weights(fine_dir / "best.weights.h5")
+            selected_stage = "fine_tuning"
+            selected_loss = fine_loss
+        else:
+            model.load_weights(head_dir / "best.weights.h5")
+            selected_stage = "head_training"
+            selected_loss = head_loss
+        schedule = {
+            "head_epoch": head_epoch,
+            "fine_tune_epoch": fine_epoch,
+            "selected_stage": selected_stage,
+            "validation_loss": selected_loss,
+        }
+    else:
+        raise ValueError(f"Unknown model variant: {variant}")
+
+    schedule["class_weights"] = class_weights
+    return model, schedule
+
+def train_final_model(
+    variant: str,
+    train_metadata: pd.DataFrame,
+    schedule: dict[str, int | bool],
     config: Config,
 ) -> tf.keras.Model:
-    train_ds = make_dataset(fold_train, config, training=True)
-    validation_ds = make_dataset(fold_validation, config, training=False)
-    class_weights = balanced_class_weights(fold_train)
-    variant_dir = config.output_dir / variant
+    tf.keras.backend.clear_session()
+    tf.keras.utils.set_random_seed(config.seed + 10_000)
+    dataset = make_dataset(train_metadata, config, training=True, seed_offset=10_000)
+    class_weights = balanced_class_weights(train_metadata)
+    write_json(config.output_dir / variant / "final_class_weights.json", class_weights)
 
     if variant == "baseline":
         model = build_scratch_cnn(config, regularized=False)
+        stage_name = "baseline final training"
         model.fit(
-            train_ds,
-            validation_data=validation_ds,
-            epochs=config.max_epochs_baseline,
+            dataset,
+            epochs=schedule["epochs"],
             class_weight=class_weights,
-            callbacks=callbacks_for_stage(config, variant_dir / "training"),
+            callbacks=callbacks_for_final_stage(
+                config.output_dir / variant / "final_training", stage_name
+            ),
             verbose=2,
         )
-        return model
-
-    if variant == "regularized":
+    elif variant == "regularized":
         model = build_scratch_cnn(config, regularized=True)
+        stage_name = "regularized final training"
         model.fit(
-            train_ds,
-            validation_data=validation_ds,
-            epochs=config.max_epochs_regularized,
+            dataset,
+            epochs=schedule["epochs"],
             class_weight=class_weights,
-            callbacks=callbacks_for_stage(config, variant_dir / "training"),
+            callbacks=callbacks_for_final_stage(
+                config.output_dir / variant / "final_training", stage_name
+            ),
             verbose=2,
         )
-        return model
+    elif variant == "transfer":
+        model = build_transfer_model(config)
+        head_stage_name = "transfer final head training"
+        model.fit(
+            dataset,
+            epochs=schedule["head_epochs"],
+            class_weight=class_weights,
+            callbacks=callbacks_for_final_stage(
+                config.output_dir / variant / "final_head_training",
+                head_stage_name,
+            ),
+            verbose=2,
+        )
+        if schedule["use_fine_tuning"]:
+            enable_transfer_fine_tuning(model, config.fine_tune_last_layers)
+            fine_stage_name = "transfer final fine-tuning"
+            model.fit(
+                dataset,
+                epochs=schedule["fine_tune_epochs"],
+                class_weight=class_weights,
+                callbacks=callbacks_for_final_stage(
+                    config.output_dir / variant / "final_fine_tuning",
+                    fine_stage_name,
+                ),
+                verbose=2,
+            )
+    else:
+        raise ValueError(variant)
+
+    model_path = config.output_dir / variant / "final_model.keras"
+    model.save(model_path)
+    return model
+
+def cross_validate_variant(
+    variant: str,
+    train_metadata: pd.DataFrame,
+    config: Config,
+) -> tuple[pd.DataFrame, dict[str, int | bool]]:
+    variant_dir = config.output_dir / variant
+    variant_dir.mkdir(parents=True, exist_ok=True)
+    fold_rows: list[dict[str, Any]] = []
+    schedules: list[dict[str, Any]] = []
+    splitter = make_cv_splitter(config)
+    strata = stratification_labels(train_metadata)
+
+    for fold_number, (train_index, validation_index) in enumerate(
+        splitter.split(train_metadata, strata, groups=train_metadata["patient_id"]),
+        start=1,
+    ):
+        fold_train = train_metadata.iloc[train_index].reset_index(drop=True)
+        fold_validation = train_metadata.iloc[validation_index].reset_index(drop=True)
+        validate_fold_integrity(fold_train, fold_validation, fold_number)
+        LOGGER.info(
+            "%s fold %d/%d: train=%d, validation=%d",
+            variant,
+            fold_number,
+            config.folds,
+            len(fold_train),
+            len(fold_validation),
+        )
+        model, schedule = train_one_fold(
+            variant,
+            fold_train,
+            fold_validation,
+            config,
+            variant_dir / f"fold_{fold_number}",
+            fold_number,
+        )
+        fold_rows.append(
+            {
+                "model": variant,
+                "fold": fold_number,
+                "train_rows": len(fold_train),
+                "validation_rows": len(fold_validation),
+                "train_patients": fold_train["patient_id"].nunique(),
+                "validation_patients": fold_validation["patient_id"].nunique(),
+                **schedule,
+            }
+        )
+        schedules.append(schedule)
+        del model
+        tf.keras.backend.clear_session()
+
+    folds_frame = pd.DataFrame(fold_rows)
+    folds_frame.to_csv(variant_dir / "cv_training_summary.csv", index=False)
 
     if variant == "transfer":
-        model = build_transfer_model(config)
-        head_dir = variant_dir / "head_training"
-        model.fit(
-            train_ds,
-            validation_data=validation_ds,
-            epochs=config.max_epochs_transfer_head,
-            class_weight=class_weights,
-            callbacks=callbacks_for_stage(config, head_dir),
-            verbose=2,
-        )
-        model.load_weights(head_dir / "best.weights.h5")
-        enable_transfer_fine_tuning(model, config.fine_tune_last_layers)
-        fine_dir = variant_dir / "fine_tuning"
-        model.fit(
-            train_ds,
-            validation_data=validation_ds,
-            epochs=config.max_epochs_transfer_finetune,
-            class_weight=class_weights,
-            callbacks=callbacks_for_stage(config, fine_dir),
-            verbose=2,
-        )
-        return model
-
-    raise ValueError(variant)
-
+        fine_tuning_selected = sum(
+            item["selected_stage"] == "fine_tuning" for item in schedules
+        ) >= math.ceil(len(schedules) / 2)
+        final_schedule = {
+            "head_epochs": max(
+                1, int(np.median([item["head_epoch"] for item in schedules]))
+            ),
+            "fine_tune_epochs": max(
+                1, int(np.median([item["fine_tune_epoch"] for item in schedules]))
+            ),
+            "use_fine_tuning": fine_tuning_selected,
+        }
+    else:
+        final_schedule = {
+            "epochs": max(
+                1, int(np.median([item["selected_epoch"] for item in schedules]))
+            )
+        }
+    write_json(variant_dir / "final_training_schedule.json", final_schedule)
+    return folds_frame, final_schedule
 
 def run_experiments(config: Config) -> None:
     configure_runtime(config)
     write_json(config.output_dir / "config.json", asdict(config))
+    train_metadata, _ = prepare_experiment_data(config)
+    if config.audit_only:
+        LOGGER.info("Audit-only run complete.")
+        return
 
-    raw_train, raw_test = load_metadata(config)
-    resolver = ImageResolver(config.dataset_root)
-    train_metadata, unresolved_train = resolve_metadata_images(raw_train, resolver)
-    test_metadata, unresolved_test = resolve_metadata_images(raw_test, resolver)
-    audit_dataset(train_metadata, test_metadata, unresolved_train, unresolved_test, config.output_dir)
-
-    splitter = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=config.seed)
-    train_index, validation_index = next(
-        splitter.split(train_metadata, groups=train_metadata["patient_id"])
-    )
-    fold_train = train_metadata.iloc[train_index].reset_index(drop=True)
-    fold_validation = train_metadata.iloc[validation_index].reset_index(drop=True)
-
+    all_cv_rows: list[pd.DataFrame] = []
     for variant in config.models:
+        LOGGER.info("Starting model: %s", variant)
+        cv_frame, schedule = cross_validate_variant(variant, train_metadata, config)
+        all_cv_rows.append(cv_frame)
+        final_model = train_final_model(variant, train_metadata, schedule, config)
+        del final_model
         tf.keras.backend.clear_session()
-        tf.keras.utils.set_random_seed(config.seed)
-        model = train_variant(variant, fold_train, fold_validation, config)
-        model_dir = config.output_dir / variant
-        model_dir.mkdir(parents=True, exist_ok=True)
-        model.save(model_dir / "model.keras")
+
+    pd.concat(all_cv_rows, ignore_index=True).to_csv(
+        config.output_dir / "all_cv_training_summary.csv", index=False
+    )
+    LOGGER.info("All requested experiments completed")
 
 
 if __name__ == "__main__":
