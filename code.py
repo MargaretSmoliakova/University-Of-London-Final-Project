@@ -206,17 +206,13 @@ def json_default(value: Any) -> Any:
 
 
 def write_json(path: Path, payload: Any) -> None:
-    path.write_text(
-        json.dumps(payload, indent=2, default=json_default), encoding="utf-8"
-    )
+    path.write_text(json.dumps(payload, indent=2, default=json_default), encoding="utf-8")
 
 
-def file_sha256(path: str | Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def normalise_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    result = frame.copy()
+    result.columns = [str(column).strip().lower() for column in result.columns]
+    return result
 
 
 def read_pixel_array(image_path: str | Path) -> np.ndarray:
@@ -234,9 +230,7 @@ def read_pixel_array(image_path: str | Path) -> np.ndarray:
 
     pixels = np.squeeze(pixels)
     if pixels.ndim != 2:
-        raise ValueError(
-            f"Expected a 2-D grayscale image, got {pixels.shape} for {path}"
-        )
+        raise ValueError(f"Expected a 2-D grayscale image, got {pixels.shape} for {path}")
     if not np.isfinite(pixels).all():
         raise ValueError(f"Non-finite pixels found in {path}")
     return pixels.astype(np.float32, copy=False)
@@ -279,6 +273,14 @@ def inspect_dicom(path_string: str) -> DicomInfo:
         series_instance_uid=str(getattr(header, "SeriesInstanceUID", "")),
         mask_like=mask_like,
     )
+
+
+def file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 class ImageResolver:
@@ -327,9 +329,7 @@ class ImageResolver:
             if suffix_candidate.is_file():
                 candidates.append(suffix_candidate.resolve())
             elif suffix_candidate.is_dir():
-                candidates.extend(
-                    sorted(path.resolve() for path in suffix_candidate.rglob("*.dcm"))
-                )
+                candidates.extend(sorted(path.resolve() for path in suffix_candidate.rglob("*.dcm")))
         return list(dict.fromkeys(candidates))
 
     def resolve_crop(self, reference: Any) -> dict[str, Any]:
@@ -393,11 +393,7 @@ class ImageResolver:
             )
 
         selected = min(tissue, key=rank)
-        method = (
-            "exact_or_direct_crop"
-            if selected.path in direct_set
-            else "case_id_ranked_crop"
-        )
+        method = "exact_or_direct_crop" if selected.path in direct_set else "case_id_ranked_crop"
         return {
             "image_path": selected.path,
             "resolution_method": method,
@@ -410,12 +406,6 @@ class ImageResolver:
             "mask_like": selected.mask_like,
             "resolution_errors": " | ".join(errors[:3]),
         }
-
-
-def normalise_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    result = frame.copy()
-    result.columns = [str(column).strip().lower() for column in result.columns]
-    return result
 
 
 def load_one_metadata(
@@ -434,9 +424,7 @@ def load_one_metadata(
     if missing:
         raise ValueError(f"{filename} is missing required columns: {sorted(missing)}")
 
-    metadata["pathology_original"] = (
-        metadata["pathology"].astype(str).str.upper().str.strip()
-    )
+    metadata["pathology_original"] = metadata["pathology"].astype(str).str.upper().str.strip()
     metadata["label"] = metadata["pathology_original"].map(PATHOLOGY_TO_LABEL)
     metadata = metadata.dropna(subset=["label", "patient_id"]).copy()
     if not include_benign_without_callback:
@@ -647,9 +635,7 @@ def audit_dataset(
         combined.groupby("image_path")["label"].nunique().loc[lambda values: values > 1]
     )
     duplicate_path_counts = (
-        combined.groupby(["official_split", "image_path"])
-        .size()
-        .loc[lambda values: values > 1]
+        combined.groupby(["official_split", "image_path"]).size().loc[lambda values: values > 1]
     )
     duplicate_rows = int((duplicate_path_counts - 1).sum())
 
@@ -740,77 +726,15 @@ def audit_dataset(
             + "; ".join(f"{name}={len(values)}" for name, values in present.items())
         )
     if len(label_conflicts):
-        raise RuntimeError(
-            "Conflicting labels were assigned to the same resolved image"
-        )
+        raise RuntimeError("Conflicting labels were assigned to the same resolved image")
     if duplicate_rows:
         raise RuntimeError(
             "The same resolved ROI is used by multiple rows inside a split; inspect "
-            "data_audit.json instead of allowing duplicated samples to "
-            "reweight training"
+            "data_audit.json instead of allowing duplicated samples to reweight training"
         )
     if train_metadata["label"].nunique() != 2 or test_metadata["label"].nunique() != 2:
-        raise RuntimeError(
-            "Both official splits must contain benign and malignant samples"
-        )
+        raise RuntimeError("Both official splits must contain benign and malignant samples")
     return audit
-
-
-def prepare_experiment_data(config: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
-    raw_train, raw_test = load_metadata(config)
-    resolver = ImageResolver(config.dataset_root)
-    train_metadata, unresolved_train = resolve_metadata_images(raw_train, resolver)
-    test_metadata, unresolved_test = resolve_metadata_images(raw_test, resolver)
-    official_split_adjustment = None
-    if config.combined_patient_overlap_policy == "exclude-train":
-        (
-            train_metadata,
-            unresolved_train,
-            official_split_adjustment,
-        ) = exclude_cross_lesion_patient_overlap_from_train(
-            train_metadata,
-            test_metadata,
-            unresolved_train,
-            config.output_dir,
-        )
-    audit = audit_dataset(
-        train_metadata,
-        test_metadata,
-        unresolved_train,
-        unresolved_test,
-        config.output_dir,
-        official_split_adjustment,
-    )
-    LOGGER.info("Data audit passed: %s", json.dumps(audit, default=json_default))
-    return train_metadata, test_metadata
-
-
-def stratification_labels(metadata: pd.DataFrame) -> np.ndarray:
-    return (
-        metadata["lesion_type"].astype(str)
-        + "_label_"
-        + metadata["label"].astype(str)
-    ).to_numpy()
-
-
-def validate_fold_integrity(
-    train_fold: pd.DataFrame, validation_fold: pd.DataFrame, fold_number: int
-) -> None:
-    overlap = set(train_fold["patient_id"]).intersection(validation_fold["patient_id"])
-    if overlap:
-        raise RuntimeError(
-            f"Patient leakage in CV fold {fold_number}: {sorted(overlap)[:10]}"
-        )
-    if train_fold["label"].nunique() != 2 or validation_fold["label"].nunique() != 2:
-        raise RuntimeError(f"Both classes are required in CV fold {fold_number}")
-
-
-def make_cv_splitter(config: Config) -> StratifiedGroupKFold:
-    return StratifiedGroupKFold(
-        n_splits=config.folds,
-        shuffle=True,
-        random_state=config.seed,
-    )
 
 
 def _numpy_load_image(path_bytes: bytes) -> np.ndarray:
@@ -855,8 +779,7 @@ def make_dataset(
             len(metadata) * config.image_size * config.image_size * 3 * 4 / (1024**3)
         )
         LOGGER.info(
-            "In-memory image cache enabled for %d rows "
-            "(approximately %.2f GiB once full)",
+            "In-memory image cache enabled for %d rows (approximately %.2f GiB once full)",
             len(metadata),
             estimated_gib,
         )
@@ -892,9 +815,7 @@ def compile_binary_model(model: tf.keras.Model, learning_rate: float) -> None:
 
 
 def build_scratch_cnn(config: Config, regularized: bool) -> tf.keras.Model:
-    inputs = tf.keras.Input(
-        (config.image_size, config.image_size, 3), name="image_0_255"
-    )
+    inputs = tf.keras.Input((config.image_size, config.image_size, 3), name="image_0_255")
     x = inputs
     if regularized:
         x = augmentation_layers()(x)
@@ -916,9 +837,7 @@ def build_scratch_cnn(config: Config, regularized: bool) -> tf.keras.Model:
         x = tf.keras.layers.Activation("relu", name=f"block{block_index}_relu")(x)
         x = tf.keras.layers.MaxPooling2D(name=f"block{block_index}_pool")(x)
         if regularized and block_index >= 3:
-            x = tf.keras.layers.SpatialDropout2D(
-                0.10, name=f"block{block_index}_drop"
-            )(x)
+            x = tf.keras.layers.SpatialDropout2D(0.10, name=f"block{block_index}_drop")(x)
 
     x = tf.keras.layers.GlobalAveragePooling2D(name="global_average_pool")(x)
     x = tf.keras.layers.Dense(
@@ -926,9 +845,7 @@ def build_scratch_cnn(config: Config, regularized: bool) -> tf.keras.Model:
     )(x)
     if regularized:
         x = tf.keras.layers.Dropout(0.40, name="head_dropout")(x)
-    outputs = tf.keras.layers.Dense(
-        1, activation="sigmoid", name="malignancy_probability"
-    )(x)
+    outputs = tf.keras.layers.Dense(1, activation="sigmoid", name="malignancy_probability")(x)
     model = tf.keras.Model(
         inputs,
         outputs,
@@ -939,9 +856,7 @@ def build_scratch_cnn(config: Config, regularized: bool) -> tf.keras.Model:
 
 
 def build_transfer_model(config: Config) -> tf.keras.Model:
-    inputs = tf.keras.Input(
-        (config.image_size, config.image_size, 3), name="image_0_255"
-    )
+    inputs = tf.keras.Input((config.image_size, config.image_size, 3), name="image_0_255")
     x = augmentation_layers()(inputs)
 
 
@@ -961,9 +876,7 @@ def build_transfer_model(config: Config) -> tf.keras.Model:
         name="classification_features",
     )(x)
     x = tf.keras.layers.Dropout(0.25, name="head_dropout_2")(x)
-    outputs = tf.keras.layers.Dense(
-        1, activation="sigmoid", name="malignancy_probability"
-    )(x)
+    outputs = tf.keras.layers.Dense(1, activation="sigmoid", name="malignancy_probability")(x)
     model = tf.keras.Model(inputs, outputs, name="efficientnetb0_transfer")
     compile_binary_model(model, learning_rate=1e-3)
     return model
@@ -977,8 +890,7 @@ def enable_transfer_fine_tuning(model: tf.keras.Model, last_layers: int) -> None
     ]
     if len(nested_models) != 1:
         raise RuntimeError(
-            "Expected one EfficientNet backbone, found "
-            f"{[layer.name for layer in nested_models]}"
+            f"Expected one EfficientNet backbone, found {[layer.name for layer in nested_models]}"
         )
     backbone = nested_models[0]
     backbone.trainable = True
@@ -994,27 +906,9 @@ def enable_transfer_fine_tuning(model: tf.keras.Model, last_layers: int) -> None
 def balanced_class_weights(metadata: pd.DataFrame) -> dict[int, float]:
     counts = metadata["label"].value_counts().sort_index()
     if set(counts.index) != {0, 1}:
-        raise ValueError(
-            f"Training fold does not contain both classes: {counts.to_dict()}"
-        )
+        raise ValueError(f"Training fold does not contain both classes: {counts.to_dict()}")
     total = float(counts.sum())
     return {int(label): total / (2.0 * float(count)) for label, count in counts.items()}
-
-
-def flush_python_log_handlers() -> None:
-    seen: set[int] = set()
-    for logger in (LOGGER, logging.getLogger()):
-        for handler in logger.handlers:
-            if id(handler) in seen:
-                continue
-            seen.add(id(handler))
-            handler.flush()
-            stream = getattr(handler, "stream", None)
-            if isinstance(handler, logging.FileHandler) and stream is not None:
-                try:
-                    os.fsync(stream.fileno())
-                except (AttributeError, OSError):
-                    pass
 
 
 class EpochTiming(tf.keras.callbacks.Callback):
@@ -1043,6 +937,22 @@ class EpochTiming(tf.keras.callbacks.Callback):
             metric_text,
         )
         flush_python_log_handlers()
+
+
+def flush_python_log_handlers() -> None:
+    seen: set[int] = set()
+    for logger in (LOGGER, logging.getLogger()):
+        for handler in logger.handlers:
+            if id(handler) in seen:
+                continue
+            seen.add(id(handler))
+            handler.flush()
+            stream = getattr(handler, "stream", None)
+            if isinstance(handler, logging.FileHandler) and stream is not None:
+                try:
+                    os.fsync(stream.fileno())
+                except (AttributeError, OSError):
+                    pass
 
 
 class ImmediateCSVLogger(tf.keras.callbacks.CSVLogger):
@@ -1115,17 +1025,13 @@ def train_one_fold(
 ) -> tuple[tf.keras.Model, dict[str, Any]]:
     tf.keras.backend.clear_session()
     tf.keras.utils.set_random_seed(config.seed + fold_number)
-    train_dataset = make_dataset(
-        train_metadata, config, training=True, seed_offset=fold_number
-    )
+    train_dataset = make_dataset(train_metadata, config, training=True, seed_offset=fold_number)
     validation_dataset = make_dataset(validation_metadata, config, training=False)
     class_weights = balanced_class_weights(train_metadata)
 
     if variant == "baseline":
         stage_name = f"baseline fold {fold_number}/{config.folds} training"
-        LOGGER.info(
-            "Starting %s (maximum %d epochs)", stage_name, config.max_epochs_baseline
-        )
+        LOGGER.info("Starting %s (maximum %d epochs)", stage_name, config.max_epochs_baseline)
         model = build_scratch_cnn(config, regularized=False)
         history = model.fit(
             train_dataset,
@@ -1221,6 +1127,103 @@ def train_one_fold(
     return model, schedule
 
 
+def make_cv_splitter(config: Config) -> StratifiedGroupKFold:
+    return StratifiedGroupKFold(
+        n_splits=config.folds,
+        shuffle=True,
+        random_state=config.seed,
+    )
+
+
+def stratification_labels(metadata: pd.DataFrame) -> np.ndarray:
+    return (
+        metadata["lesion_type"].astype(str)
+        + "_label_"
+        + metadata["label"].astype(str)
+    ).to_numpy()
+
+
+def validate_fold_integrity(
+    train_fold: pd.DataFrame, validation_fold: pd.DataFrame, fold_number: int
+) -> None:
+    overlap = set(train_fold["patient_id"]).intersection(validation_fold["patient_id"])
+    if overlap:
+        raise RuntimeError(f"Patient leakage in CV fold {fold_number}: {sorted(overlap)[:10]}")
+    if train_fold["label"].nunique() != 2 or validation_fold["label"].nunique() != 2:
+        raise RuntimeError(f"Both classes are required in CV fold {fold_number}")
+
+
+def cross_validate_variant(
+    variant: str,
+    train_metadata: pd.DataFrame,
+    config: Config,
+) -> tuple[pd.DataFrame, dict[str, int | bool]]:
+    variant_dir = config.output_dir / variant
+    variant_dir.mkdir(parents=True, exist_ok=True)
+    fold_rows: list[dict[str, Any]] = []
+    schedules: list[dict[str, Any]] = []
+    splitter = make_cv_splitter(config)
+    strata = stratification_labels(train_metadata)
+
+    for fold_number, (train_index, validation_index) in enumerate(
+        splitter.split(train_metadata, strata, groups=train_metadata["patient_id"]), start=1
+    ):
+        fold_train = train_metadata.iloc[train_index].reset_index(drop=True)
+        fold_validation = train_metadata.iloc[validation_index].reset_index(drop=True)
+        validate_fold_integrity(fold_train, fold_validation, fold_number)
+        LOGGER.info(
+            "%s fold %d/%d: train=%d, validation=%d",
+            variant,
+            fold_number,
+            config.folds,
+            len(fold_train),
+            len(fold_validation),
+        )
+        model, schedule = train_one_fold(
+            variant,
+            fold_train,
+            fold_validation,
+            config,
+            variant_dir / f"fold_{fold_number}",
+            fold_number,
+        )
+        fold_rows.append(
+            {
+                "model": variant,
+                "fold": fold_number,
+                "train_rows": len(fold_train),
+                "validation_rows": len(fold_validation),
+                "train_patients": fold_train["patient_id"].nunique(),
+                "validation_patients": fold_validation["patient_id"].nunique(),
+                **schedule,
+            }
+        )
+        schedules.append(schedule)
+        del model
+        tf.keras.backend.clear_session()
+
+    folds_frame = pd.DataFrame(fold_rows)
+    folds_frame.to_csv(variant_dir / "cv_training_summary.csv", index=False)
+
+    if variant == "transfer":
+        fine_tuning_selected = sum(
+            item["selected_stage"] == "fine_tuning" for item in schedules
+        ) >= math.ceil(len(schedules) / 2)
+        final_schedule = {
+            "head_epochs": max(1, int(np.median([item["head_epoch"] for item in schedules]))),
+            "fine_tune_epochs": max(
+                1, int(np.median([item["fine_tune_epoch"] for item in schedules]))
+            ),
+            "use_fine_tuning": fine_tuning_selected,
+        }
+    else:
+        final_schedule = {
+            "epochs": max(1, int(np.median([item["selected_epoch"] for item in schedules])))
+        }
+    write_json(variant_dir / "final_training_schedule.json", final_schedule)
+    return folds_frame, final_schedule
+
+
 def train_final_model(
     variant: str,
     train_metadata: pd.DataFrame,
@@ -1291,82 +1294,6 @@ def train_final_model(
     return model
 
 
-def cross_validate_variant(
-    variant: str,
-    train_metadata: pd.DataFrame,
-    config: Config,
-) -> tuple[pd.DataFrame, dict[str, int | bool]]:
-    variant_dir = config.output_dir / variant
-    variant_dir.mkdir(parents=True, exist_ok=True)
-    fold_rows: list[dict[str, Any]] = []
-    schedules: list[dict[str, Any]] = []
-    splitter = make_cv_splitter(config)
-    strata = stratification_labels(train_metadata)
-
-    for fold_number, (train_index, validation_index) in enumerate(
-        splitter.split(train_metadata, strata, groups=train_metadata["patient_id"]),
-        start=1,
-    ):
-        fold_train = train_metadata.iloc[train_index].reset_index(drop=True)
-        fold_validation = train_metadata.iloc[validation_index].reset_index(drop=True)
-        validate_fold_integrity(fold_train, fold_validation, fold_number)
-        LOGGER.info(
-            "%s fold %d/%d: train=%d, validation=%d",
-            variant,
-            fold_number,
-            config.folds,
-            len(fold_train),
-            len(fold_validation),
-        )
-        model, schedule = train_one_fold(
-            variant,
-            fold_train,
-            fold_validation,
-            config,
-            variant_dir / f"fold_{fold_number}",
-            fold_number,
-        )
-        fold_rows.append(
-            {
-                "model": variant,
-                "fold": fold_number,
-                "train_rows": len(fold_train),
-                "validation_rows": len(fold_validation),
-                "train_patients": fold_train["patient_id"].nunique(),
-                "validation_patients": fold_validation["patient_id"].nunique(),
-                **schedule,
-            }
-        )
-        schedules.append(schedule)
-        del model
-        tf.keras.backend.clear_session()
-
-    folds_frame = pd.DataFrame(fold_rows)
-    folds_frame.to_csv(variant_dir / "cv_training_summary.csv", index=False)
-
-    if variant == "transfer":
-        fine_tuning_selected = sum(
-            item["selected_stage"] == "fine_tuning" for item in schedules
-        ) >= math.ceil(len(schedules) / 2)
-        final_schedule = {
-            "head_epochs": max(
-                1, int(np.median([item["head_epoch"] for item in schedules]))
-            ),
-            "fine_tune_epochs": max(
-                1, int(np.median([item["fine_tune_epoch"] for item in schedules]))
-            ),
-            "use_fine_tuning": fine_tuning_selected,
-        }
-    else:
-        final_schedule = {
-            "epochs": max(
-                1, int(np.median([item["selected_epoch"] for item in schedules]))
-            )
-        }
-    write_json(variant_dir / "final_training_schedule.json", final_schedule)
-    return folds_frame, final_schedule
-
-
 def write_and_log_training_plan(config: Config) -> None:
     plan: list[dict[str, Any]] = []
     for variant in config.models:
@@ -1411,7 +1338,31 @@ def run_experiments(config: Config) -> None:
     write_json(config.output_dir / "config.json", asdict(config))
     if not config.audit_only:
         write_and_log_training_plan(config)
-    train_metadata, _ = prepare_experiment_data(config)
+    raw_train, raw_test = load_metadata(config)
+    resolver = ImageResolver(config.dataset_root)
+    train_metadata, unresolved_train = resolve_metadata_images(raw_train, resolver)
+    test_metadata, unresolved_test = resolve_metadata_images(raw_test, resolver)
+    official_split_adjustment = None
+    if config.combined_patient_overlap_policy == "exclude-train":
+        (
+            train_metadata,
+            unresolved_train,
+            official_split_adjustment,
+        ) = exclude_cross_lesion_patient_overlap_from_train(
+            train_metadata,
+            test_metadata,
+            unresolved_train,
+            config.output_dir,
+        )
+    audit = audit_dataset(
+        train_metadata,
+        test_metadata,
+        unresolved_train,
+        unresolved_test,
+        config.output_dir,
+        official_split_adjustment,
+    )
+    LOGGER.info("Data audit passed: %s", json.dumps(audit, default=json_default))
     if config.audit_only:
         LOGGER.info("Audit-only run complete.")
         return
