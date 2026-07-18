@@ -285,15 +285,19 @@ class ImageResolver:
     def __init__(self, dataset_root: Path):
         self.dataset_root = dataset_root
         self.by_case_id: dict[str, list[Path]] = {}
+        self.case_ids_by_patient: dict[str, set[str]] = {}
         dicom_paths = sorted(dataset_root.rglob("*.dcm"))
         if not dicom_paths:
             raise FileNotFoundError(f"No DICOM files found under {dataset_root}")
         for path in dicom_paths:
             match = CASE_ID_PATTERN.search(path.as_posix())
             if match:
-                self.by_case_id.setdefault(match.group(0).lower(), []).append(
-                    path.resolve()
-                )
+                case_id = match.group(0).lower()
+                self.by_case_id.setdefault(case_id, []).append(path.resolve())
+                patient_match = re.search(r"p_\d+", case_id, re.IGNORECASE)
+                if patient_match:
+                    patient_id = patient_match.group(0).lower()
+                    self.case_ids_by_patient.setdefault(patient_id, set()).add(case_id)
         LOGGER.info(
             "Indexed %d DICOM files across %d case identifiers",
             len(dicom_paths),
@@ -340,10 +344,23 @@ class ImageResolver:
         case_candidates = self.by_case_id.get(case_id, []) if case_id else []
         candidates = list(dict.fromkeys(direct_candidates + case_candidates))
         if not candidates:
+            patient_match = re.search(r"p_\d+", case_id, re.IGNORECASE)
+            patient_id = patient_match.group(0).lower() if patient_match else ""
+            available_for_patient = sorted(
+                self.case_ids_by_patient.get(patient_id, set())
+            )
+            same_view_prefix = re.sub(r"_\d+$", "", case_id)
+            same_view_candidates = [
+                available_case_id
+                for available_case_id in available_for_patient
+                if available_case_id.startswith(same_view_prefix)
+            ]
             return {
                 "image_path": None,
                 "resolution_method": "unresolved",
                 "case_id": case_id,
+                "available_case_ids_for_patient": " | ".join(available_for_patient),
+                "same_view_case_id_candidates": " | ".join(same_view_candidates),
             }
 
         inspected: list[DicomInfo] = []
@@ -641,11 +658,42 @@ def audit_dataset(
     test_hashes = {file_sha256(path): path for path in sorted(test_paths)}
     hash_overlap = sorted(set(train_hashes).intersection(test_hashes))
 
+    unresolved_summary = {
+        "train_rows": int(len(unresolved_train)),
+        "test_rows": int(len(unresolved_test)),
+        "train_by_lesion_type": (
+            unresolved_train["lesion_type"].value_counts().to_dict()
+            if len(unresolved_train)
+            else {}
+        ),
+        "test_by_lesion_type": (
+            unresolved_test["lesion_type"].value_counts().to_dict()
+            if len(unresolved_test)
+            else {}
+        ),
+        "train_by_label": (
+            unresolved_train["label"].value_counts().sort_index().to_dict()
+            if len(unresolved_train)
+            else {}
+        ),
+        "test_by_label": (
+            unresolved_test["label"].value_counts().sort_index().to_dict()
+            if len(unresolved_test)
+            else {}
+        ),
+        "train_unique_patients": int(unresolved_train["patient_id"].nunique()),
+        "test_unique_patients": int(unresolved_test["patient_id"].nunique()),
+        "test_case_id_examples": (
+            unresolved_test["case_id"].dropna().astype(str).head(20).tolist()
+        ),
+    }
+
     audit = {
         "train": split_summary(train_metadata),
         "test": split_summary(test_metadata),
         "unresolved_train_rows": int(len(unresolved_train)),
         "unresolved_test_rows": int(len(unresolved_test)),
+        "unresolved_summary": unresolved_summary,
         "patient_overlap_count": len(patient_overlap),
         "patient_overlap_examples": patient_overlap[:20],
         "path_overlap_count": len(path_overlap),
@@ -668,6 +716,16 @@ def audit_dataset(
     unresolved_test.to_csv(output_dir / "unresolved_test.csv", index=False)
     train_metadata.to_csv(output_dir / "resolved_train_manifest.csv", index=False)
     test_metadata.to_csv(output_dir / "resolved_test_manifest.csv", index=False)
+
+    if len(unresolved_train) or len(unresolved_test):
+        raise RuntimeError(
+            "Incomplete metadata-to-DICOM resolution; training stopped to avoid "
+            "silently changing the official split. "
+            f"unresolved train rows={len(unresolved_train)}, "
+            f"unresolved test rows={len(unresolved_test)}. Inspect unresolved_train.csv, "
+            "unresolved_test.csv, and data_audit.json. Missing DICOM files must be "
+            "restored before training."
+        )
 
     leakage_failures = {
         "patient overlap": patient_overlap,
