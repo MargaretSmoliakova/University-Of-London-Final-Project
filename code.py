@@ -12,7 +12,7 @@ import time
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -24,6 +24,17 @@ try:
     from pydicom.pixels import apply_modality_lut, apply_voi_lut
 except ImportError:
     from pydicom.pixel_data_handlers.util import apply_modality_lut, apply_voi_lut
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    brier_score_loss,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    roc_auc_score,
+    roc_curve,
+)
 from sklearn.model_selection import StratifiedGroupKFold
 
 
@@ -35,14 +46,8 @@ PATHOLOGY_TO_LABEL = {
     "MALIGNANT": 1,
 }
 METADATA_FILES = {
-    "mass": (
-        "mass_case_description_train_set.csv",
-        "mass_case_description_test_set.csv",
-    ),
-    "calcification": (
-        "calc_case_description_train_set.csv",
-        "calc_case_description_test_set.csv",
-    ),
+    "mass": ("mass_case_description_train_set.csv", "mass_case_description_test_set.csv"),
+    "calcification": ("calc_case_description_train_set.csv", "calc_case_description_test_set.csv"),
 }
 CASE_ID_PATTERN = re.compile(
     r"(Mass|Calc)-(Training|Test)_P_\d+_(LEFT|RIGHT)_(CC|MLO)_\d+",
@@ -67,6 +72,9 @@ class Config:
     max_epochs_transfer_finetune: int = 20
     early_stopping_patience: int = 7
     fine_tune_last_layers: int = 40
+    target_sensitivity: float = 0.90
+    bootstrap_repeats: int = 2000
+    calibration_fraction: float = 0.15
     include_benign_without_callback: bool = False
     combined_patient_overlap_policy: str = "error"
     dataset_cache: str = "none"
@@ -86,6 +94,13 @@ class DicomInfo:
     @property
     def area(self) -> int:
         return self.rows * self.columns
+
+
+@dataclass(frozen=True)
+class Thresholds:
+    default: float
+    youden_validation: float
+    sensitivity_target_validation: float
 
 
 def parse_args() -> Config:
