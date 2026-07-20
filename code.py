@@ -226,7 +226,7 @@ def json_default(value: Any) -> Any:
         return value.item()
     if isinstance(value, np.ndarray):
         return value.tolist()
-    raise TypeError(f"Cannot serialise {type(value)!r}")
+    raise TypeError(f"Unsupported type: {type(value).__name__}")
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -254,9 +254,9 @@ def read_pixel_array(image_path: str | Path) -> np.ndarray:
 
     pixels = np.squeeze(pixels)
     if pixels.ndim != 2:
-        raise ValueError(f"Expected a 2-D grayscale image, got {pixels.shape} for {path}")
+        raise ValueError(f"Invalid image shape: {pixels.shape}")
     if not np.isfinite(pixels).all():
-        raise ValueError(f"Non-finite pixels found in {path}")
+        raise ValueError(f"Non-finite pixels: {path.name}")
     return pixels.astype(np.float32, copy=False)
 
 
@@ -267,7 +267,7 @@ def percentile_window_to_255(pixels: np.ndarray) -> np.ndarray:
     if not np.isfinite(low) or not np.isfinite(high) or high <= low:
         low, high = float(np.min(pixels)), float(np.max(pixels))
     if high <= low:
-        raise ValueError("Image has no usable intensity range")
+        raise ValueError("Invalid intensity range")
     clipped = np.clip(pixels, low, high)
     return ((clipped - low) * (255.0 / (high - low))).astype(np.float32)
 
@@ -312,9 +312,10 @@ class ImageResolver:
         self.dataset_root = dataset_root
         self.by_case_id: dict[str, list[Path]] = {}
         self.case_ids_by_patient: dict[str, set[str]] = {}
+        self.by_series_uid: dict[str, list[Path]] = {}
         dicom_paths = sorted(dataset_root.rglob("*.dcm"))
         if not dicom_paths:
-            raise FileNotFoundError(f"No DICOM files found under {dataset_root}")
+            raise FileNotFoundError("No DICOM files found")
         for path in dicom_paths:
             match = CASE_ID_PATTERN.search(path.as_posix())
             if match:
