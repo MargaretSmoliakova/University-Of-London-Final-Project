@@ -135,6 +135,9 @@ def parse_args() -> Config:
     parser.add_argument("--max-epochs-transfer-finetune", type=int, default=20)
     parser.add_argument("--early-stopping-patience", type=int, default=7)
     parser.add_argument("--fine-tune-last-layers", type=int, default=40)
+    parser.add_argument("--target-sensitivity", type=float, default=0.90)
+    parser.add_argument("--bootstrap-repeats", type=int, default=2000)
+    parser.add_argument("--calibration-fraction", type=float, default=0.15)
     parser.add_argument("--include-benign-without-callback", action="store_true")
     parser.add_argument(
         "--dataset-cache",
@@ -144,16 +147,19 @@ def parse_args() -> Config:
     parser.add_argument("--audit-only", action="store_true")
     args = parser.parse_args()
 
+    if not 0.0 < args.target_sensitivity < 1.0:
+        parser.error("--target-sensitivity out of range")
     if args.folds < 2:
-        parser.error("--folds must be at least 2")
+        parser.error("--folds < 2")
+    if args.bootstrap_repeats < 200:
+        parser.error("--bootstrap-repeats < 200")
+    if not 0.05 <= args.calibration_fraction <= 0.30:
+        parser.error("--calibration-fraction out of range")
     if (
         args.combined_patient_overlap_policy == "exclude-train"
         and args.lesion_type != "both"
     ):
-        parser.error(
-            "--combined-patient-overlap-policy exclude-train is only valid with "
-            "--lesion-type both"
-        )
+        parser.error("Invalid overlap policy for lesion type")
 
     output_root = args.output_dir.resolve()
     script_output_folder = Path(__file__).stem
@@ -178,6 +184,9 @@ def parse_args() -> Config:
         max_epochs_transfer_finetune=args.max_epochs_transfer_finetune,
         early_stopping_patience=args.early_stopping_patience,
         fine_tune_last_layers=args.fine_tune_last_layers,
+        target_sensitivity=args.target_sensitivity,
+        bootstrap_repeats=args.bootstrap_repeats,
+        calibration_fraction=args.calibration_fraction,
         include_benign_without_callback=args.include_benign_without_callback,
         combined_patient_overlap_policy=args.combined_patient_overlap_policy,
         dataset_cache=args.dataset_cache,
@@ -207,7 +216,7 @@ def configure_runtime(config: Config) -> None:
         tf.config.experimental.enable_op_determinism()
         LOGGER.info("TensorFlow deterministic operations enabled")
     except Exception as exc:
-        LOGGER.warning("Could not enable complete TensorFlow determinism: %s", exc)
+        LOGGER.warning("Determinism failed: %s", type(exc).__name__)
 
 
 def json_default(value: Any) -> Any:
