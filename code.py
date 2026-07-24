@@ -501,7 +501,7 @@ def load_one_metadata(
     required = {"patient_id", "pathology", "cropped image file path"}
     missing = required.difference(metadata.columns)
     if missing:
-        raise ValueError(f"{filename} is missing required columns: {sorted(missing)}")
+        raise ValueError(f"Missing columns: {sorted(missing)}")
 
     metadata["pathology_original"] = metadata["pathology"].astype(str).str.upper().str.strip()
     metadata["label"] = metadata["pathology_original"].map(PATHOLOGY_TO_LABEL)
@@ -659,13 +659,9 @@ def exclude_cross_lesion_patient_overlap_from_train(
     }
 
     if same_lesion_overlap:
-        report["status"] = "failed: same-lesion official split overlap detected"
+        report["status"] = "failed: same-lesion overlap"
         write_json(output_dir / "combined_patient_overlap_resolution.json", report)
-        raise RuntimeError(
-            "The exclude-train policy only permits cross-lesion overlap caused by "
-            "combining the separate mass and calcification partitions. Same-lesion "
-            f"patient overlap remains for {len(same_lesion_overlap)} patients."
-        )
+        raise RuntimeError(f"Same-lesion overlap: {len(same_lesion_overlap)} patients")
 
     filtered_train = train_metadata[
         ~train_metadata["patient_id"].isin(patient_overlap)
@@ -676,14 +672,13 @@ def exclude_cross_lesion_patient_overlap_from_train(
 
     remaining_overlap = set(filtered_train["patient_id"]).intersection(test_patients)
     if remaining_overlap:
-        raise AssertionError("Patient overlap remained after train-only exclusion")
+        raise AssertionError("Patient overlap remains")
 
     report["train_after"] = split_summary(filtered_train)
     report["status"] = "applied"
     write_json(output_dir / "combined_patient_overlap_resolution.json", report)
     LOGGER.warning(
-        "Excluded %d resolved and %d unresolved train rows from %d patients to "
-        "keep the combined official test set patient-disjoint",
+        "Excluded overlapping rows: %d resolved, %d unresolved; %d patients",
         len(excluded_resolved),
         len(excluded_unresolved),
         len(patient_overlap),
@@ -783,14 +778,7 @@ def audit_dataset(
     test_metadata.to_csv(output_dir / "resolved_test_manifest.csv", index=False)
 
     if len(unresolved_train) or len(unresolved_test):
-        raise RuntimeError(
-            "Incomplete metadata-to-DICOM resolution; training stopped to avoid "
-            "silently changing the official split. "
-            f"unresolved train rows={len(unresolved_train)}, "
-            f"unresolved test rows={len(unresolved_test)}. Inspect unresolved_train.csv, "
-            "unresolved_test.csv, and data_audit.json. Missing DICOM files must be "
-            "restored before training."
-        )
+        raise RuntimeError(f"Unresolved images: train={len(unresolved_train)}, test={len(unresolved_test)}")
 
     leakage_failures = {
         "patient overlap": patient_overlap,
@@ -800,20 +788,38 @@ def audit_dataset(
     }
     present = {name: values for name, values in leakage_failures.items() if values}
     if present:
-        raise RuntimeError(
-            "Potential official train/test leakage detected; training stopped. "
-            + "; ".join(f"{name}={len(values)}" for name, values in present.items())
-        )
+        raise RuntimeError("Train/test leakage")
     if len(label_conflicts):
-        raise RuntimeError("Conflicting labels were assigned to the same resolved image")
+        raise RuntimeError("Conflicting image labels")
     if duplicate_rows:
-        raise RuntimeError(
-            "The same resolved ROI is used by multiple rows inside a split; inspect "
-            "data_audit.json instead of allowing duplicated samples to reweight training"
-        )
+        raise RuntimeError("Duplicate image rows")
     if train_metadata["label"].nunique() != 2 or test_metadata["label"].nunique() != 2:
-        raise RuntimeError("Both official splits must contain benign and malignant samples")
+        raise RuntimeError("Class missing from split")
     return audit
+
+
+def save_visual_samples(metadata: pd.DataFrame, output_dir: Path, count: int = 24) -> None:
+    sample_dir = output_dir / "sample_check"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    if metadata.empty:
+        return
+    sample_count = min(count, len(metadata))
+    sampled_parts: list[pd.DataFrame] = []
+    for _, group in metadata.groupby(["lesion_type", "label"]):
+        sampled_parts.append(
+            group.sample(n=min(max(1, sample_count // 4), len(group)), random_state=17)
+        )
+    sampled = pd.concat(sampled_parts, ignore_index=True).head(sample_count)
+    for index, row in enumerate(sampled.itertuples(index=False)):
+        pixels = percentile_window_to_255(read_pixel_array(row.image_path))
+        image = Image.fromarray(pixels.astype(np.uint8)).resize(
+            (384, 384), resample=Image.Resampling.BILINEAR
+        )
+        image.save(
+            sample_dir
+            / f"{index:02d}_{row.lesion_type}_label-{row.label}_{row.patient_id}.png"
+        )
+    LOGGER.info("Saved %d images for mandatory manual ROI inspection", len(sampled))
 
 
 def _numpy_load_image(path_bytes: bytes) -> np.ndarray:
@@ -890,6 +896,11 @@ def compile_binary_model(model: tf.keras.Model, learning_rate: float) -> None:
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
         loss=tf.keras.losses.BinaryCrossentropy(),
+        metrics=[
+            tf.keras.metrics.BinaryAccuracy(name="accuracy", threshold=0.5),
+            tf.keras.metrics.AUC(name="roc_auc", curve="ROC"),
+            tf.keras.metrics.AUC(name="pr_auc", curve="PR"),
+        ],
     )
 
 
@@ -968,9 +979,7 @@ def enable_transfer_fine_tuning(model: tf.keras.Model, last_layers: int) -> None
         if isinstance(layer, tf.keras.Model) and "efficientnet" in layer.name.lower()
     ]
     if len(nested_models) != 1:
-        raise RuntimeError(
-            f"Expected one EfficientNet backbone, found {[layer.name for layer in nested_models]}"
-        )
+        raise RuntimeError(f"Invalid backbone count: {len(nested_models)}")
     backbone = nested_models[0]
     backbone.trainable = True
     cutoff = max(0, len(backbone.layers) - last_layers)
@@ -985,7 +994,7 @@ def enable_transfer_fine_tuning(model: tf.keras.Model, last_layers: int) -> None
 def balanced_class_weights(metadata: pd.DataFrame) -> dict[int, float]:
     counts = metadata["label"].value_counts().sort_index()
     if set(counts.index) != {0, 1}:
-        raise ValueError(f"Training fold does not contain both classes: {counts.to_dict()}")
+        raise ValueError("Missing training class")
     total = float(counts.sum())
     return {int(label): total / (2.0 * float(count)) for label, count in counts.items()}
 
@@ -1054,14 +1063,14 @@ def callbacks_for_stage(
         EpochTiming(stage_name),
         tf.keras.callbacks.ModelCheckpoint(
             stage_dir / "best.weights.h5",
-            monitor="val_loss",
-            mode="min",
+            monitor="val_pr_auc",
+            mode="max",
             save_best_only=True,
             save_weights_only=True,
         ),
         tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss",
-            mode="min",
+            monitor="val_pr_auc",
+            mode="max",
             patience=config.early_stopping_patience,
             restore_best_weights=True,
         ),
@@ -1089,9 +1098,35 @@ def callbacks_for_final_stage(
 
 
 def best_epoch_and_value(history: tf.keras.callbacks.History) -> tuple[int, float]:
-    values = np.asarray(history.history["val_loss"], dtype=float)
-    best_index = int(np.nanargmin(values))
+    values = np.asarray(history.history["val_pr_auc"], dtype=float)
+    best_index = int(np.nanargmax(values))
     return best_index + 1, float(values[best_index])
+
+
+def report_stage_quality(
+    history: tf.keras.callbacks.History,
+    stage_name: str,
+    validation_metadata: pd.DataFrame,
+) -> None:
+    best_epoch, best_pr_auc = best_epoch_and_value(history)
+    roc_values = np.asarray(history.history.get("val_roc_auc", []), dtype=float)
+    best_roc_auc = float(np.nanmax(roc_values)) if roc_values.size else float("nan")
+    prevalence = float(validation_metadata["label"].mean())
+    LOGGER.info(
+        "%s summary: best_epoch=%d, best_val_pr_auc=%.4f, "
+        "best_val_roc_auc=%.4f, malignant_prevalence=%.4f",
+        stage_name,
+        best_epoch,
+        best_pr_auc,
+        best_roc_auc,
+        prevalence,
+    )
+    if np.isfinite(best_roc_auc) and best_roc_auc < 0.55:
+        LOGGER.warning(
+            "%s: low validation ROC-AUC %.4f",
+            stage_name,
+            best_roc_auc,
+        )
 
 
 def train_one_fold(
