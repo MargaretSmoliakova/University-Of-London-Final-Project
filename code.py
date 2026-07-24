@@ -317,18 +317,31 @@ class ImageResolver:
         if not dicom_paths:
             raise FileNotFoundError("No DICOM files found")
         for path in dicom_paths:
+            resolved_path = path.resolve()
             match = CASE_ID_PATTERN.search(path.as_posix())
             if match:
                 case_id = match.group(0).lower()
-                self.by_case_id.setdefault(case_id, []).append(path.resolve())
+                self.by_case_id.setdefault(case_id, []).append(resolved_path)
                 patient_match = re.search(r"p_\d+", case_id, re.IGNORECASE)
                 if patient_match:
                     patient_id = patient_match.group(0).lower()
                     self.case_ids_by_patient.setdefault(patient_id, set()).add(case_id)
+
+            uid_path_components = [
+                component
+                for component in path.parts
+                if UID_COMPONENT_PATTERN.fullmatch(component)
+            ]
+            if uid_path_components:
+
+
+                series_uid = uid_path_components[-1]
+                self.by_series_uid.setdefault(series_uid, []).append(resolved_path)
         LOGGER.info(
-            "Indexed %d DICOM files across %d case identifiers",
+            "Indexed %d DICOM files across %d case identifiers and %d series UID directories",
             len(dicom_paths),
             len(self.by_case_id),
+            len(self.by_series_uid),
         )
 
     @staticmethod
@@ -336,8 +349,17 @@ class ImageResolver:
         return {
             component
             for component in reference.replace("\\", "/").split("/")
-            if UID_COMPONENT_PATTERN.match(component)
+            if UID_COMPONENT_PATTERN.fullmatch(component)
         }
+
+    @staticmethod
+    def _series_uid(reference: str) -> str:
+        uid_components = [
+            component
+            for component in reference.replace("\\", "/").split("/")
+            if UID_COMPONENT_PATTERN.fullmatch(component)
+        ]
+        return uid_components[-1] if uid_components else ""
 
     def _direct_candidates(self, reference: str) -> list[Path]:
         normalised = reference.replace("\\", "/").lstrip("/")
@@ -364,10 +386,22 @@ class ImageResolver:
         match = CASE_ID_PATTERN.search(reference_string.replace("\\", "/"))
         case_id = match.group(0).lower() if match else ""
         uid_components = self._uid_components(reference_string)
+        requested_series_uid = self._series_uid(reference_string)
 
         direct_candidates = self._direct_candidates(reference_string)
         case_candidates = self.by_case_id.get(case_id, []) if case_id else []
-        candidates = list(dict.fromkeys(direct_candidates + case_candidates))
+        primary_candidates = list(dict.fromkeys(direct_candidates + case_candidates))
+        uid_candidates = (
+            self.by_series_uid.get(requested_series_uid, [])
+            if requested_series_uid
+            else []
+        )
+        used_series_uid_fallback = not primary_candidates and bool(uid_candidates)
+        candidates = (
+            list(dict.fromkeys(uid_candidates))
+            if used_series_uid_fallback
+            else primary_candidates
+        )
         if not candidates:
             patient_match = re.search(r"p_\d+", case_id, re.IGNORECASE)
             patient_id = patient_match.group(0).lower() if patient_match else ""
@@ -384,6 +418,7 @@ class ImageResolver:
                 "image_path": None,
                 "resolution_method": "unresolved",
                 "case_id": case_id,
+                "requested_series_instance_uid": requested_series_uid,
                 "available_case_ids_for_patient": " | ".join(available_for_patient),
                 "same_view_case_id_candidates": " | ".join(same_view_candidates),
             }
@@ -396,12 +431,24 @@ class ImageResolver:
             except Exception as exc:
                 errors.append(f"{candidate}: {exc}")
 
+        if used_series_uid_fallback:
+            inspected = [
+                info
+                for info in inspected
+                if info.series_instance_uid == requested_series_uid
+            ]
+
         tissue = [info for info in inspected if not info.mask_like]
         if not tissue:
             return {
                 "image_path": None,
-                "resolution_method": "only_mask_or_unreadable_candidates",
+                "resolution_method": (
+                    "series_uid_header_mismatch_or_no_tissue"
+                    if used_series_uid_fallback
+                    else "only_mask_or_unreadable_candidates"
+                ),
                 "case_id": case_id,
+                "requested_series_instance_uid": requested_series_uid,
                 "resolution_errors": " | ".join(errors[:3]),
             }
 
@@ -418,7 +465,14 @@ class ImageResolver:
             )
 
         selected = min(tissue, key=rank)
-        method = "exact_or_direct_crop" if selected.path in direct_set else "case_id_ranked_crop"
+        if used_series_uid_fallback:
+            method = "series_uid_ranked_crop"
+        else:
+            method = (
+                "exact_or_direct_crop"
+                if selected.path in direct_set
+                else "case_id_ranked_crop"
+            )
         return {
             "image_path": selected.path,
             "resolution_method": method,
@@ -442,7 +496,7 @@ def load_one_metadata(
 ) -> pd.DataFrame:
     path = dataset_root / filename
     if not path.exists():
-        raise FileNotFoundError(f"Metadata file not found: {path}")
+        raise FileNotFoundError(f"Missing metadata: {filename}")
     metadata = normalise_columns(pd.read_csv(path))
     required = {"patient_id", "pathology", "cropped image file path"}
     missing = required.difference(metadata.columns)
