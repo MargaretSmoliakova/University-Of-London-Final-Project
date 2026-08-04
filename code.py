@@ -1155,11 +1155,12 @@ def train_one_fold(
             callbacks=callbacks_for_stage(config, fold_dir / "training", stage_name),
             verbose=2,
         )
-        selected_epoch, selected_loss = best_epoch_and_value(history)
+        report_stage_quality(history, stage_name, validation_metadata)
+        selected_epoch, selected_pr_auc = best_epoch_and_value(history)
         schedule = {
             "selected_epoch": selected_epoch,
             "selected_stage": "single_stage",
-            "validation_loss": selected_loss,
+            "validation_pr_auc": selected_pr_auc,
         }
     elif variant == "regularized":
         stage_name = f"regularized fold {fold_number}/{config.folds} training"
@@ -1177,11 +1178,12 @@ def train_one_fold(
             callbacks=callbacks_for_stage(config, fold_dir / "training", stage_name),
             verbose=2,
         )
-        selected_epoch, selected_loss = best_epoch_and_value(history)
+        report_stage_quality(history, stage_name, validation_metadata)
+        selected_epoch, selected_pr_auc = best_epoch_and_value(history)
         schedule = {
             "selected_epoch": selected_epoch,
             "selected_stage": "single_stage",
-            "validation_loss": selected_loss,
+            "validation_pr_auc": selected_pr_auc,
         }
     elif variant == "transfer":
         model = build_transfer_model(config)
@@ -1200,7 +1202,8 @@ def train_one_fold(
             callbacks=callbacks_for_stage(config, head_dir, head_stage_name),
             verbose=2,
         )
-        head_epoch, head_loss = best_epoch_and_value(head_history)
+        report_stage_quality(head_history, head_stage_name, validation_metadata)
+        head_epoch, head_pr_auc = best_epoch_and_value(head_history)
         model.load_weights(head_dir / "best.weights.h5")
 
         enable_transfer_fine_tuning(model, config.fine_tune_last_layers)
@@ -1219,26 +1222,111 @@ def train_one_fold(
             callbacks=callbacks_for_stage(config, fine_dir, fine_stage_name),
             verbose=2,
         )
-        fine_epoch, fine_loss = best_epoch_and_value(fine_history)
-        if fine_loss <= head_loss:
+        report_stage_quality(fine_history, fine_stage_name, validation_metadata)
+        fine_epoch, fine_pr_auc = best_epoch_and_value(fine_history)
+        if fine_pr_auc >= head_pr_auc:
             model.load_weights(fine_dir / "best.weights.h5")
             selected_stage = "fine_tuning"
-            selected_loss = fine_loss
+            selected_pr_auc = fine_pr_auc
         else:
             model.load_weights(head_dir / "best.weights.h5")
             selected_stage = "head_training"
-            selected_loss = head_loss
+            selected_pr_auc = head_pr_auc
         schedule = {
             "head_epoch": head_epoch,
             "fine_tune_epoch": fine_epoch,
             "selected_stage": selected_stage,
-            "validation_loss": selected_loss,
+            "validation_pr_auc": selected_pr_auc,
         }
     else:
-        raise ValueError(f"Unknown model variant: {variant}")
+        raise ValueError(f"Unknown model: {variant}")
 
     schedule["class_weights"] = class_weights
     return model, schedule
+
+
+def safe_ratio(numerator: int, denominator: int) -> float:
+    return float(numerator / denominator) if denominator else float("nan")
+
+
+def compute_metrics(
+    true_labels: Sequence[int],
+    probabilities: Sequence[float],
+    threshold: float,
+) -> dict[str, float | int]:
+    y_true = np.asarray(true_labels, dtype=int)
+    y_probability = np.asarray(probabilities, dtype=float)
+    y_predicted = (y_probability >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_predicted, labels=[0, 1]).ravel()
+    has_two_classes = np.unique(y_true).size == 2
+    return {
+        "threshold": float(threshold),
+        "n": int(len(y_true)),
+        "prevalence": float(np.mean(y_true)),
+        "accuracy": float(accuracy_score(y_true, y_predicted)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_predicted)),
+        "sensitivity": safe_ratio(int(tp), int(tp + fn)),
+        "specificity": safe_ratio(int(tn), int(tn + fp)),
+        "precision_ppv": float(precision_score(y_true, y_predicted, zero_division=0)),
+        "negative_predictive_value": safe_ratio(int(tn), int(tn + fn)),
+        "f1": float(f1_score(y_true, y_predicted, zero_division=0)),
+        "roc_auc": float(roc_auc_score(y_true, y_probability)) if has_two_classes else float("nan"),
+        "average_precision": (
+            float(average_precision_score(y_true, y_probability))
+            if has_two_classes
+            else float("nan")
+        ),
+        "brier_score": float(brier_score_loss(y_true, y_probability)),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+    }
+
+
+def select_validation_thresholds(
+    true_labels: Sequence[int], probabilities: Sequence[float], target_sensitivity: float
+) -> Thresholds:
+    y_true = np.asarray(true_labels, dtype=int)
+    y_probability = np.asarray(probabilities, dtype=float)
+    fpr, tpr, thresholds = roc_curve(y_true, y_probability, drop_intermediate=False)
+    finite = np.isfinite(thresholds)
+    fpr, tpr, thresholds = fpr[finite], tpr[finite], thresholds[finite]
+
+    youden = tpr - fpr
+    best_youden = np.flatnonzero(youden == np.max(youden))
+
+    youden_index = int(best_youden[np.argmax(thresholds[best_youden])])
+
+    eligible = np.flatnonzero(tpr >= target_sensitivity)
+    if not len(eligible):
+        raise RuntimeError(f"Sensitivity target unmet: {target_sensitivity:.3f}")
+    best_specificity = np.min(fpr[eligible])
+    specificity_ties = eligible[fpr[eligible] == best_specificity]
+    sensitivity_index = int(specificity_ties[np.argmax(thresholds[specificity_ties])])
+    return Thresholds(
+        default=0.5,
+        youden_validation=float(thresholds[youden_index]),
+        sensitivity_target_validation=float(thresholds[sensitivity_index]),
+    )
+
+
+def save_operating_points(
+    true_labels: Sequence[int], probabilities: Sequence[float], output_path: Path
+) -> None:
+    y_true = np.asarray(true_labels, dtype=int)
+    y_probability = np.asarray(probabilities, dtype=float)
+    fpr, tpr, thresholds = roc_curve(y_true, y_probability, drop_intermediate=False)
+    finite = np.isfinite(thresholds)
+    table = pd.DataFrame(
+        {
+            "threshold": thresholds[finite],
+            "sensitivity": tpr[finite],
+            "specificity": 1.0 - fpr[finite],
+            "youden_j": tpr[finite] - fpr[finite],
+        }
+    )
+    table.to_csv(output_path, index=False)
 
 
 def make_cv_splitter(config: Config) -> StratifiedGroupKFold:
@@ -1257,23 +1345,64 @@ def stratification_labels(metadata: pd.DataFrame) -> np.ndarray:
     ).to_numpy()
 
 
+def make_development_calibration_split(
+    train_metadata: pd.DataFrame, config: Config
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    approximate_splits = max(3, int(round(1.0 / config.calibration_fraction)))
+    splitter = StratifiedGroupKFold(
+        n_splits=approximate_splits,
+        shuffle=True,
+        random_state=config.seed + 101,
+    )
+    strata = stratification_labels(train_metadata)
+    candidates = list(
+        splitter.split(train_metadata, strata, groups=train_metadata["patient_id"])
+    )
+    target_rows = config.calibration_fraction * len(train_metadata)
+    development_index, calibration_index = min(
+        candidates, key=lambda pair: abs(len(pair[1]) - target_rows)
+    )
+    development = train_metadata.iloc[development_index].reset_index(drop=True)
+    calibration = train_metadata.iloc[calibration_index].reset_index(drop=True)
+    validate_fold_integrity(development, calibration, fold_number=0)
+
+    assignment = train_metadata[
+        ["patient_id", "case_id", "lesion_type", "label", "image_path"]
+    ].copy()
+    assignment["internal_role"] = "development"
+    assignment.loc[calibration_index, "internal_role"] = "calibration"
+    assignment.to_csv(config.output_dir / "internal_split_assignments.csv", index=False)
+    write_json(
+        config.output_dir / "internal_split_summary.json",
+        {
+            "development": split_summary(development),
+            "calibration": split_summary(calibration),
+            "requested_calibration_fraction": config.calibration_fraction,
+            "actual_calibration_fraction": len(calibration) / len(train_metadata),
+        },
+    )
+    return development, calibration
+
+
 def validate_fold_integrity(
     train_fold: pd.DataFrame, validation_fold: pd.DataFrame, fold_number: int
 ) -> None:
     overlap = set(train_fold["patient_id"]).intersection(validation_fold["patient_id"])
     if overlap:
-        raise RuntimeError(f"Patient leakage in CV fold {fold_number}: {sorted(overlap)[:10]}")
+        raise RuntimeError(f"Patient overlap in fold {fold_number}")
     if train_fold["label"].nunique() != 2 or validation_fold["label"].nunique() != 2:
-        raise RuntimeError(f"Both classes are required in CV fold {fold_number}")
+        raise RuntimeError(f"Missing class in fold {fold_number}")
 
 
 def cross_validate_variant(
     variant: str,
     train_metadata: pd.DataFrame,
     config: Config,
-) -> tuple[pd.DataFrame, dict[str, int | bool]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
     variant_dir = config.output_dir / variant
     variant_dir.mkdir(parents=True, exist_ok=True)
+    oof_probability = np.full(len(train_metadata), np.nan, dtype=float)
+    oof_fold = np.full(len(train_metadata), -1, dtype=int)
     fold_rows: list[dict[str, Any]] = []
     schedules: list[dict[str, Any]] = []
     splitter = make_cv_splitter(config)
