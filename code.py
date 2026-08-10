@@ -1430,6 +1430,12 @@ def cross_validate_variant(
             variant_dir / f"fold_{fold_number}",
             fold_number,
         )
+        probabilities = model.predict(
+            make_dataset(fold_validation, config, training=False), verbose=0
+        ).ravel()
+        oof_probability[validation_index] = probabilities
+        oof_fold[validation_index] = fold_number
+        fold_metrics = compute_metrics(fold_validation["label"], probabilities, 0.5)
         fold_rows.append(
             {
                 "model": variant,
@@ -1439,14 +1445,24 @@ def cross_validate_variant(
                 "train_patients": fold_train["patient_id"].nunique(),
                 "validation_patients": fold_validation["patient_id"].nunique(),
                 **schedule,
+                **fold_metrics,
             }
         )
         schedules.append(schedule)
         del model
         tf.keras.backend.clear_session()
 
+    if np.isnan(oof_probability).any():
+        raise RuntimeError(f"Missing OOF predictions: {variant}")
     folds_frame = pd.DataFrame(fold_rows)
-    folds_frame.to_csv(variant_dir / "cv_training_summary.csv", index=False)
+    folds_frame.to_csv(variant_dir / "cv_fold_metrics.csv", index=False)
+    oof = train_metadata[
+        ["patient_id", "lesion_type", "label", "image_path", "pathology_original"]
+    ].copy()
+    oof["model"] = variant
+    oof["fold"] = oof_fold
+    oof["probability"] = oof_probability
+    oof.to_csv(variant_dir / "oof_predictions.csv", index=False)
 
     if variant == "transfer":
         fine_tuning_selected = sum(
@@ -1464,13 +1480,13 @@ def cross_validate_variant(
             "epochs": max(1, int(np.median([item["selected_epoch"] for item in schedules])))
         }
     write_json(variant_dir / "final_training_schedule.json", final_schedule)
-    return folds_frame, final_schedule
+    return folds_frame, oof, final_schedule
 
 
 def train_final_model(
     variant: str,
     train_metadata: pd.DataFrame,
-    schedule: dict[str, int | bool],
+    schedule: dict[str, int],
     config: Config,
 ) -> tf.keras.Model:
     tf.keras.backend.clear_session()
@@ -1530,11 +1546,156 @@ def train_final_model(
                 verbose=2,
             )
     else:
-        raise ValueError(variant)
+        raise ValueError(f"Unknown model: {variant}")
 
     model_path = config.output_dir / variant / "final_model.keras"
     model.save(model_path)
     return model
+
+
+def threshold_rows(
+    model_name: str,
+    split_name: str,
+    metadata: pd.DataFrame,
+    probabilities: np.ndarray,
+    thresholds: Thresholds,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for policy, threshold in asdict(thresholds).items():
+        rows.append(
+            {
+                "model": model_name,
+                "split": split_name,
+                "threshold_policy": policy,
+                **compute_metrics(metadata["label"], probabilities, threshold),
+            }
+        )
+    return rows
+
+
+def bootstrap_confidence_intervals(
+    metadata: pd.DataFrame,
+    probabilities: np.ndarray,
+    thresholds: Thresholds,
+    repeats: int,
+    seed: int,
+) -> pd.DataFrame:
+    groups = metadata["patient_id"].astype(str).to_numpy()
+    unique_groups = np.unique(groups)
+    group_indices = {group: np.flatnonzero(groups == group) for group in unique_groups}
+    y_true = metadata["label"].to_numpy(dtype=int)
+    rng = np.random.default_rng(seed)
+    policies = asdict(thresholds)
+    metric_names = (
+        "roc_auc",
+        "average_precision",
+        "brier_score",
+        "balanced_accuracy",
+        "sensitivity",
+        "specificity",
+        "precision_ppv",
+        "negative_predictive_value",
+        "f1",
+    )
+    draws: dict[tuple[str, str], list[float]] = {
+        (policy, metric): [] for policy in policies for metric in metric_names
+    }
+
+    for _ in range(repeats):
+        sampled_groups = rng.choice(unique_groups, size=len(unique_groups), replace=True)
+        sampled_indices = np.concatenate([group_indices[group] for group in sampled_groups])
+        sampled_labels = y_true[sampled_indices]
+        if np.unique(sampled_labels).size < 2:
+            continue
+        sampled_probabilities = probabilities[sampled_indices]
+        for policy, threshold in policies.items():
+            metrics = compute_metrics(sampled_labels, sampled_probabilities, threshold)
+            for metric in metric_names:
+                value = float(metrics[metric])
+                if np.isfinite(value):
+                    draws[(policy, metric)].append(value)
+
+    rows: list[dict[str, Any]] = []
+    for (policy, metric), values in draws.items():
+        if not values:
+            continue
+        rows.append(
+            {
+                "threshold_policy": policy,
+                "metric": metric,
+                "ci_lower_95": float(np.percentile(values, 2.5)),
+                "ci_upper_95": float(np.percentile(values, 97.5)),
+                "valid_bootstrap_repeats": len(values),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def subgroup_rows(
+    model_name: str,
+    test_metadata: pd.DataFrame,
+    probabilities: np.ndarray,
+    thresholds: Thresholds,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for lesion_type, indices in test_metadata.groupby("lesion_type").groups.items():
+        subset = test_metadata.loc[indices]
+        subset_probabilities = probabilities[np.asarray(indices, dtype=int)]
+        for policy, threshold in asdict(thresholds).items():
+            rows.append(
+                {
+                    "model": model_name,
+                    "lesion_type": lesion_type,
+                    "threshold_policy": policy,
+                    **compute_metrics(subset["label"], subset_probabilities, threshold),
+                }
+            )
+    return rows
+
+
+def paired_auc_bootstrap(
+    test_metadata: pd.DataFrame,
+    prediction_columns: dict[str, np.ndarray],
+    repeats: int,
+    seed: int,
+) -> pd.DataFrame:
+    if len(prediction_columns) < 2:
+        return pd.DataFrame()
+    groups = test_metadata["patient_id"].astype(str).to_numpy()
+    unique_groups = np.unique(groups)
+    group_indices = {group: np.flatnonzero(groups == group) for group in unique_groups}
+    y_true = test_metadata["label"].to_numpy(dtype=int)
+    rng = np.random.default_rng(seed)
+    model_names = list(prediction_columns)
+    rows: list[dict[str, Any]] = []
+
+    for first_index, first in enumerate(model_names):
+        for second in model_names[first_index + 1 :]:
+            observed = roc_auc_score(y_true, prediction_columns[second]) - roc_auc_score(
+                y_true, prediction_columns[first]
+            )
+            differences: list[float] = []
+            for _ in range(repeats):
+                sampled_groups = rng.choice(unique_groups, size=len(unique_groups), replace=True)
+                sampled_indices = np.concatenate([group_indices[group] for group in sampled_groups])
+                sampled_labels = y_true[sampled_indices]
+                if np.unique(sampled_labels).size < 2:
+                    continue
+                difference = roc_auc_score(
+                    sampled_labels, prediction_columns[second][sampled_indices]
+                ) - roc_auc_score(sampled_labels, prediction_columns[first][sampled_indices])
+                differences.append(float(difference))
+            rows.append(
+                {
+                    "reference_model": first,
+                    "comparison_model": second,
+                    "test_auc_difference_comparison_minus_reference": float(observed),
+                    "ci_lower_95": float(np.percentile(differences, 2.5)),
+                    "ci_upper_95": float(np.percentile(differences, 97.5)),
+                    "valid_bootstrap_repeats": len(differences),
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def write_and_log_training_plan(config: Config) -> None:
@@ -1606,22 +1767,161 @@ def run_experiments(config: Config) -> None:
         official_split_adjustment,
     )
     LOGGER.info("Data audit passed: %s", json.dumps(audit, default=json_default))
+    save_visual_samples(train_metadata, config.output_dir)
     if config.audit_only:
-        LOGGER.info("Audit-only run complete.")
+        LOGGER.info("Audit-only run complete. Inspect sample_check before training.")
         return
+    development_metadata, calibration_metadata = make_development_calibration_split(
+        train_metadata, config
+    )
 
     all_cv_rows: list[pd.DataFrame] = []
-    for variant in config.models:
+    all_metric_rows: list[dict[str, Any]] = []
+    all_subgroup_rows: list[dict[str, Any]] = []
+    all_ci_rows: list[pd.DataFrame] = []
+    test_predictions: dict[str, np.ndarray] = {}
+
+    for model_index, variant in enumerate(config.models):
         LOGGER.info("Starting model: %s", variant)
-        cv_frame, schedule = cross_validate_variant(variant, train_metadata, config)
+        cv_frame, oof, schedule = cross_validate_variant(
+            variant, development_metadata, config
+        )
         all_cv_rows.append(cv_frame)
-        final_model = train_final_model(variant, train_metadata, schedule, config)
+        exploratory_oof_thresholds = select_validation_thresholds(
+            oof["label"], oof["probability"], config.target_sensitivity
+        )
+        write_json(
+            config.output_dir / variant / "exploratory_oof_thresholds.json",
+            {
+                "selection_source": "development_out_of_fold_predictions",
+                **asdict(exploratory_oof_thresholds),
+            },
+        )
+        save_operating_points(
+            oof["label"],
+            oof["probability"],
+            config.output_dir / variant / "oof_operating_points.csv",
+        )
+        all_metric_rows.extend(
+            threshold_rows(
+                variant,
+                "development_oof",
+                development_metadata,
+                oof["probability"].to_numpy(),
+                exploratory_oof_thresholds,
+            )
+        )
+
+        final_model = train_final_model(variant, development_metadata, schedule, config)
+        calibration_probability = final_model.predict(
+            make_dataset(calibration_metadata, config, training=False), verbose=0
+        ).ravel()
+        thresholds = select_validation_thresholds(
+            calibration_metadata["label"],
+            calibration_probability,
+            config.target_sensitivity,
+        )
+        write_json(
+            config.output_dir / variant / "final_calibration_thresholds.json",
+            {
+                "selection_source": "reserved_patient_level_calibration_subset",
+                **asdict(thresholds),
+            },
+        )
+        save_operating_points(
+            calibration_metadata["label"],
+            calibration_probability,
+            config.output_dir / variant / "calibration_operating_points.csv",
+        )
+        calibration_predictions = calibration_metadata[
+            [
+                "patient_id",
+                "case_id",
+                "lesion_type",
+                "label",
+                "image_path",
+                "pathology_original",
+            ]
+        ].copy()
+        calibration_predictions["probability"] = calibration_probability
+        calibration_predictions.to_csv(
+            config.output_dir / variant / "calibration_predictions.csv", index=False
+        )
+        all_metric_rows.extend(
+            threshold_rows(
+                variant,
+                "reserved_calibration",
+                calibration_metadata,
+                calibration_probability,
+                thresholds,
+            )
+        )
+
+        test_probability = final_model.predict(
+            make_dataset(test_metadata, config, training=False), verbose=0
+        ).ravel()
+        test_predictions[variant] = test_probability
+        prediction_frame = test_metadata[
+            [
+                "patient_id",
+                "case_id",
+                "lesion_type",
+                "label",
+                "image_path",
+                "pathology_original",
+            ]
+        ].copy()
+        prediction_frame["probability"] = test_probability
+        for policy, threshold in asdict(thresholds).items():
+            predicted = (test_probability >= threshold).astype(int)
+            prediction_frame[f"prediction_{policy}"] = predicted
+            prediction_frame[f"error_{policy}"] = np.select(
+                [
+                    (prediction_frame["label"].to_numpy() == 1) & (predicted == 0),
+                    (prediction_frame["label"].to_numpy() == 0) & (predicted == 1),
+                ],
+                ["false_negative", "false_positive"],
+                default="correct",
+            )
+        prediction_frame.to_csv(
+            config.output_dir / variant / "official_test_predictions.csv", index=False
+        )
+        all_metric_rows.extend(
+            threshold_rows(variant, "official_test", test_metadata, test_probability, thresholds)
+        )
+        all_subgroup_rows.extend(
+            subgroup_rows(variant, test_metadata, test_probability, thresholds)
+        )
+        ci_frame = bootstrap_confidence_intervals(
+            test_metadata,
+            test_probability,
+            thresholds,
+            repeats=config.bootstrap_repeats,
+            seed=config.seed + 20_000 + model_index,
+        )
+        ci_frame.insert(0, "model", variant)
+        all_ci_rows.append(ci_frame)
         del final_model
         tf.keras.backend.clear_session()
 
     pd.concat(all_cv_rows, ignore_index=True).to_csv(
-        config.output_dir / "all_cv_training_summary.csv", index=False
+        config.output_dir / "all_cv_fold_metrics.csv", index=False
     )
+    pd.DataFrame(all_metric_rows).to_csv(
+        config.output_dir / "all_operating_point_metrics.csv", index=False
+    )
+    pd.DataFrame(all_subgroup_rows).to_csv(
+        config.output_dir / "official_test_subgroup_metrics.csv", index=False
+    )
+    pd.concat(all_ci_rows, ignore_index=True).to_csv(
+        config.output_dir / "official_test_cluster_bootstrap_cis.csv", index=False
+    )
+    paired_auc_bootstrap(
+        test_metadata,
+        test_predictions,
+        repeats=config.bootstrap_repeats,
+        seed=config.seed + 30_000,
+    ).to_csv(config.output_dir / "official_test_paired_auc_differences.csv", index=False)
     LOGGER.info("All requested experiments completed")
 
 
