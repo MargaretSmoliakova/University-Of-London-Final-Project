@@ -54,9 +54,7 @@ def write_model_specifications(config: Config) -> None:
     )
 
 
-def save_oof_results(
-    variant: str, oof: pd.DataFrame, config: Config
-) -> Thresholds:
+def save_oof_results(variant: str, oof: pd.DataFrame, config: Config) -> Thresholds:
     exploratory_thresholds = select_validation_thresholds(
         oof["label"], oof["probability"], config.target_sensitivity
     )

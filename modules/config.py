@@ -82,26 +82,26 @@ def parse_experiment_args(program_name: str) -> Config:
     args = parser.parse_args()
 
     if not 0.0 < args.target_sensitivity < 1.0:
-        parser.error('--target-sensitivity out of range')
+        parser.error("--target-sensitivity out of range")
     if args.folds < 2:
-        parser.error('--folds < 2')
+        parser.error("--folds < 2")
     if args.bootstrap_repeats < 200:
-        parser.error('--bootstrap-repeats < 200')
+        parser.error("--bootstrap-repeats < 200")
     if not 0.05 <= args.calibration_fraction <= 0.30:
-        parser.error('--calibration-fraction out of range')
+        parser.error("--calibration-fraction out of range")
     if args.image_size < 64:
-        parser.error('--image-size < 64')
+        parser.error("--image-size < 64")
     if args.batch_size < 1:
-        parser.error('--batch-size < 1')
+        parser.error("--batch-size < 1")
     if args.early_stopping_patience < 1:
-        parser.error('--early-stopping-patience < 1')
+        parser.error("--early-stopping-patience < 1")
     if args.fine_tune_last_layers < 1:
-        parser.error('--fine-tune-last-layers < 1')
+        parser.error("--fine-tune-last-layers < 1")
     if (
         args.combined_patient_overlap_policy == "exclude-train"
         and args.lesion_type != "both"
     ):
-        parser.error('Invalid overlap policy for lesion type')
+        parser.error("Invalid overlap policy for lesion type")
 
     output_root = args.output_dir.resolve()
     versioned_output = (

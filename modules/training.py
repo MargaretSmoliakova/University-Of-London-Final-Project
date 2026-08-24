@@ -271,19 +271,30 @@ def cross_validate_variant(
     oof.to_csv(variant_dir / "oof_predictions.csv", index=False)
 
     if variant == "transfer":
-        use_fine = sum(x["selected_stage"] == "fine_tuning" for x in schedules) >= math.ceil(
-            len(schedules) / 2
-        )
+        use_fine = sum(
+            fold_schedule["selected_stage"] == "fine_tuning"
+            for fold_schedule in schedules
+        ) >= math.ceil(len(schedules) / 2)
         final_schedule: dict[str, int | bool] = {
-            "head_epochs": max(1, int(np.median([x["head_epoch"] for x in schedules]))),
+            "head_epochs": max(
+                1,
+                int(np.median([fold_schedule["head_epoch"] for fold_schedule in schedules])),
+            ),
             "fine_tune_epochs": max(
-                1, int(np.median([x["fine_tune_epoch"] for x in schedules]))
+                1, int(np.median([fold_schedule["fine_tune_epoch"] for fold_schedule in schedules]))
             ),
             "use_fine_tuning": use_fine,
         }
     else:
         final_schedule = {
-            "epochs": max(1, int(np.median([x["selected_epoch"] for x in schedules])))
+            "epochs": max(
+                1,
+                int(
+                    np.median(
+                        [fold_schedule["selected_epoch"] for fold_schedule in schedules]
+                    )
+                ),
+            )
         }
     write_json(variant_dir / "final_training_schedule.json", final_schedule)
     return folds_frame, oof, final_schedule
