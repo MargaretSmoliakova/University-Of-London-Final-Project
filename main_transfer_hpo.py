@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from modules.hpo import HPOConfig, parse_hpo_args, run_hpo
+from hpo.config import HPOConfig, parse_hpo_args
+from hpo.experiment import run_hpo
 
 
 def parse_args() -> HPOConfig:
