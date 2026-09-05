@@ -18,7 +18,8 @@ from modules.training import validate_fold_integrity
 from .callbacks import best_history_epoch, training_callbacks
 from .config import HPOConfig, TransferSearchSpec
 from .data import make_fold_datasets
-from .models import build_transfer_model, enable_fine_tuning
+from .models import build_regularized_model, build_transfer_model, enable_fine_tuning
+from .regularized_config import RegularizedHPOConfig, RegularizedSearchSpec, SearchSpec
 
 
 def predict_probabilities(model: tf.keras.Model, dataset: tf.data.Dataset) -> np.ndarray:
@@ -196,3 +197,96 @@ def train_transfer_fold(
     gc.collect()
 
     return row, selected_probabilities
+
+
+def train_regularized_fold(
+    spec: RegularizedSearchSpec,
+    development: pd.DataFrame,
+    train_indices: np.ndarray,
+    validation_indices: np.ndarray,
+    experiment_config: Config,
+    hpo_config: RegularizedHPOConfig,
+    fold_dir: Path,
+    fold_number: int,
+    total_folds: int,
+    epochs: int,
+    patience: int,
+    deadline: float,
+    preloaded: tuple[np.ndarray, np.ndarray] | None,
+    trial: Any | None,
+    allow_pruning: bool,
+) -> tuple[dict[str, Any], np.ndarray]:
+    tf.keras.backend.clear_session()
+    trial_number = int(trial.number) if trial is not None else 10_000
+    training_seed = hpo_config.seed + fold_number
+    tf.keras.utils.set_random_seed(training_seed)
+
+    train = development.iloc[train_indices].reset_index(drop=True)
+    validation = development.iloc[validation_indices].reset_index(drop=True)
+    validate_fold_integrity(train, validation, fold_number)
+    train_dataset, validation_dataset = make_fold_datasets(
+        development,
+        train_indices,
+        validation_indices,
+        experiment_config,
+        preloaded,
+        training_seed,
+    )
+
+    class_weights = balanced_class_weights(train)
+    model = build_regularized_model(experiment_config, spec)
+
+    prefix = (
+        f"trial {trial_number} fold {fold_number}/{total_folds}"
+        if trial is not None
+        else f"confirmation fold {fold_number}/{total_folds}"
+    )
+
+    result = _fit_training_stage(
+        model=model,
+        train_dataset=train_dataset,
+        validation_dataset=validation_dataset,
+        validation=validation,
+        class_weights=class_weights,
+        stage_dir=fold_dir / "training",
+        stage_name=f"{prefix} regularized training",
+        epochs=epochs,
+        patience=patience,
+        deadline=deadline,
+        trial=trial,
+        step_offset=(fold_number - 1) * epochs,
+        allow_pruning=allow_pruning,
+    )
+
+    trainable_parameter_count = int(
+        sum(np.prod(variable.shape) for variable in model.trainable_weights)
+    )
+
+    row: dict[str, Any] = {
+        "fold": fold_number,
+        "train_rows": len(train),
+        "validation_rows": len(validation),
+        "train_patients": int(train["patient_id"].nunique()),
+        "validation_patients": int(validation["patient_id"].nunique()),
+        "selected_epoch": result.epoch,
+        "keras_val_pr_auc": result.pr_auc,
+        "fold_seconds": float(result.seconds),
+        "total_parameter_count": int(model.count_params()),
+        "trainable_parameter_count": trainable_parameter_count,
+        "class_weight_0": float(class_weights[0]),
+        "class_weight_1": float(class_weights[1]),
+        **result.metrics,
+    }
+
+    del model, train_dataset, validation_dataset
+    tf.keras.backend.clear_session()
+    gc.collect()
+
+    return row, result.probabilities
+
+
+def get_fold_trainer(spec: SearchSpec):
+    if isinstance(spec, RegularizedSearchSpec):
+        return train_regularized_fold
+
+    return train_transfer_fold

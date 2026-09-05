@@ -13,8 +13,12 @@ from .plots import create_screen_plots
 from .runtime import optuna
 
 
-def trial_table(study: Any) -> pd.DataFrame:
-    parameter_names = sorted(SEARCH_SPACE)
+def trial_table(
+    study: Any,
+    search_space: dict[str, Any] = SEARCH_SPACE,
+    trial_attributes: tuple[str, ...] = (),
+) -> pd.DataFrame:
+    parameter_names = sorted(search_space)
 
     rows: list[dict[str, Any]] = []
 
@@ -36,6 +40,10 @@ def trial_table(study: Any) -> pd.DataFrame:
             ),
             "oof_roc_auc": trial.user_attrs.get("oof_roc_auc", np.nan),
             "oof_brier": trial.user_attrs.get("oof_brier", np.nan),
+            **{
+                name: trial.user_attrs.get(name, np.nan)
+                for name in trial_attributes
+            },
             "failure": trial.user_attrs.get("failure", ""),
         }
 
@@ -47,8 +55,13 @@ def trial_table(study: Any) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def save_live_trials(study: Any, output_dir: Path) -> None:
-    table = trial_table(study)
+def save_live_trials(
+    study: Any,
+    output_dir: Path,
+    search_space: dict[str, Any] = SEARCH_SPACE,
+    trial_attributes: tuple[str, ...] = (),
+) -> None:
+    table = trial_table(study, search_space, trial_attributes)
     table.to_csv(output_dir / "all_trials.csv", index=False)
 
     if len(table):
@@ -65,12 +78,13 @@ def save_live_trials(study: Any, output_dir: Path) -> None:
 
 def calculate_parameter_effects(
     completed: pd.DataFrame,
+    search_space: dict[str, Any] = SEARCH_SPACE,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     effect_rows: list[dict[str, Any]] = []
     correlation_rows: list[dict[str, Any]] = []
     objective = "objective_mean_fold_average_precision"
 
-    for name in sorted(SEARCH_SPACE):
+    for name in sorted(search_space):
         column = f"param_{name}"
         subset = completed[[column, objective]].dropna().copy()
         if subset.empty:
@@ -173,15 +187,20 @@ def parameter_importance_table(study: Any) -> pd.DataFrame:
     )
 
 
-def save_screen_analysis(study: Any, output_dir: Path) -> dict[str, pd.DataFrame]:
-    save_live_trials(study, output_dir)
-    trials = trial_table(study)
+def save_screen_analysis(
+    study: Any,
+    output_dir: Path,
+    search_space: dict[str, Any] = SEARCH_SPACE,
+    trial_attributes: tuple[str, ...] = (),
+) -> dict[str, pd.DataFrame]:
+    save_live_trials(study, output_dir, search_space, trial_attributes)
+    trials = trial_table(study, search_space, trial_attributes)
     completed = trials[trials["state"] == "COMPLETE"].copy()
 
     importances = parameter_importance_table(study)
     importances.to_csv(output_dir / "parameter_importance.csv", index=False)
 
-    effects, correlations = calculate_parameter_effects(completed)
+    effects, correlations = calculate_parameter_effects(completed, search_space)
     effects.to_csv(output_dir / "parameter_effect_summary.csv", index=False)
     correlations.to_csv(output_dir / "parameter_rank_correlations.csv", index=False)
 
@@ -190,7 +209,7 @@ def save_screen_analysis(study: Any, output_dir: Path) -> dict[str, pd.DataFrame
         output_dir / "automatic_parameter_interpretation.csv", index=False
     )
 
-    create_screen_plots(trials, importances, output_dir)
+    create_screen_plots(trials, importances, output_dir, search_space)
 
     if len(completed):
         best = completed.sort_values(
@@ -223,4 +242,15 @@ def save_screen_analysis(study: Any, output_dir: Path) -> dict[str, pd.DataFrame
         "effects": effects,
         "correlations": correlations,
         "interpretation": parameter_summary,
+    }
+
+
+def regularized_fold_summary(folds: pd.DataFrame) -> dict[str, float | int]:
+    if "selected_epoch" not in folds:
+        return {}
+
+    return {
+        "median_selected_epoch": float(folds["selected_epoch"].median()),
+        "mean_fold_seconds": float(folds["fold_seconds"].mean()),
+        "trainable_parameter_count": int(folds["trainable_parameter_count"].iloc[0]),
     }

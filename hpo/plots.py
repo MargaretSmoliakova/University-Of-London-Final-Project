@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -25,7 +26,7 @@ def _plot_optimization_history(completed: pd.DataFrame, plot_dir: Path, plt: Mod
 
     axis.set_xlabel("Trial number")
     axis.set_ylabel("Mean screen-fold Average Precision")
-    axis.set_title("Transfer-learning hyperparameter optimisation history")
+    axis.set_title("Hyperparameter optimisation history")
     axis.grid(alpha=0.25)
     axis.legend()
 
@@ -74,8 +75,13 @@ def _plot_parameter_importance(importances: pd.DataFrame, plot_dir: Path, plt: M
         plt.close(figure)
 
 
-def _plot_parameter_effects(completed: pd.DataFrame, plot_dir: Path, plt: ModuleType) -> None:
-    parameter_names = sorted(SEARCH_SPACE)
+def _plot_parameter_effects(
+    completed: pd.DataFrame,
+    plot_dir: Path,
+    plt: ModuleType,
+    search_space: dict[str, Any],
+) -> None:
+    parameter_names = sorted(search_space)
     columns = 3
     rows = math.ceil(len(parameter_names) / columns)
     figure, axes = plt.subplots(rows, columns, figsize=(16, 4.1 * rows))
@@ -121,6 +127,7 @@ def create_screen_plots(
     trials: pd.DataFrame,
     importances: pd.DataFrame,
     output_dir: Path,
+    search_space: dict[str, Any] = SEARCH_SPACE,
 ) -> None:
     import matplotlib
 
@@ -140,7 +147,7 @@ def create_screen_plots(
 
     _plot_parameter_importance(importances, plot_dir, plt)
 
-    _plot_parameter_effects(completed, plot_dir, plt)
+    _plot_parameter_effects(completed, plot_dir, plt, search_space)
 
 
 def create_confirmation_plot(

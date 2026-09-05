@@ -13,11 +13,15 @@ from modules.config import Config
 from modules.metrics import compute_metrics
 
 from .callbacks import DeadlineReached
-from .config import HPOConfig, REFERENCE_SPEC, TransferSearchSpec, spec_from_mapping
-from .training import train_transfer_fold
+from .config import REFERENCE_SPEC, spec_from_mapping
+from .regularized_config import SearchConfig, SearchSpec
+from .results import regularized_fold_summary
+from .training import get_fold_trainer
 
 
-def confirmation_candidates(study: Any, top_k: int) -> list[tuple[str, TransferSearchSpec]]:
+def confirmation_candidates(
+    study: Any, top_k: int, reference_spec: SearchSpec = REFERENCE_SPEC
+) -> list[tuple[str, SearchSpec]]:
     completed = [trial for trial in study.trials if trial.state.name == "COMPLETE"]
     ranked = sorted(
         completed,
@@ -28,11 +32,11 @@ def confirmation_candidates(study: Any, top_k: int) -> list[tuple[str, TransferS
         ),
     )
 
-    candidates: list[tuple[str, TransferSearchSpec]] = [("reference", REFERENCE_SPEC)]
-    seen = {json.dumps(REFERENCE_SPEC.serialisable(), sort_keys=True)}
+    candidates: list[tuple[str, SearchSpec]] = [("reference", reference_spec)]
+    seen = {json.dumps(reference_spec.serialisable(), sort_keys=True)}
 
     for trial in ranked:
-        spec = spec_from_mapping(trial.params)
+        spec = spec_from_mapping(trial.params, type(reference_spec))
         key = json.dumps(spec.serialisable(), sort_keys=True)
         if key in seen:
             continue
@@ -48,11 +52,11 @@ def confirmation_candidates(study: Any, top_k: int) -> list[tuple[str, TransferS
 
 def _run_confirmation_folds(
     candidate_name: str,
-    spec: TransferSearchSpec,
+    spec: SearchSpec,
     development: pd.DataFrame,
     splits: list[tuple[np.ndarray, np.ndarray]],
     experiment_config: Config,
-    hpo_config: HPOConfig,
+    hpo_config: SearchConfig,
     preloaded: tuple[np.ndarray, np.ndarray] | None,
     total_deadline: float,
     candidate_dir: Path,
@@ -62,10 +66,11 @@ def _run_confirmation_folds(
     probabilities = np.full(len(development), np.nan, dtype=float)
     assignments = np.zeros(len(development), dtype=int)
     complete = True
+    train_fold = get_fold_trainer(spec)
 
     for fold_number, (train_indices, validation_indices) in enumerate(splits, start=1):
         try:
-            row, fold_probabilities = train_transfer_fold(
+            row, fold_probabilities = train_fold(
                 spec=spec,
                 development=development,
                 train_indices=train_indices,
@@ -75,8 +80,7 @@ def _run_confirmation_folds(
                 fold_dir=candidate_dir / f"fold_{fold_number}",
                 fold_number=fold_number,
                 total_folds=len(splits),
-                head_epochs=hpo_config.confirmation_head_epochs,
-                finetune_epochs=hpo_config.confirmation_finetune_epochs,
+                **hpo_config.training_epochs(confirmation=True),
                 patience=hpo_config.confirmation_patience,
                 deadline=total_deadline,
                 preloaded=preloaded,
@@ -104,11 +108,11 @@ def _run_confirmation_folds(
 
 
 def run_confirmation(
-    candidates: list[tuple[str, TransferSearchSpec]],
+    candidates: list[tuple[str, SearchSpec]],
     development: pd.DataFrame,
     splits: list[tuple[np.ndarray, np.ndarray]],
     experiment_config: Config,
-    hpo_config: HPOConfig,
+    hpo_config: SearchConfig,
     preloaded: tuple[np.ndarray, np.ndarray] | None,
     total_deadline: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -194,6 +198,7 @@ def _rank_confirmation_candidates(
                     "mean_fold_roc_auc": float(candidate_folds["roc_auc"].mean()),
                     "sd_fold_roc_auc": float(candidate_folds["roc_auc"].std(ddof=1)),
                     "mean_fold_brier": float(candidate_folds["brier_score"].mean()),
+                    **regularized_fold_summary(candidate_folds),
                     "oof_average_precision": metrics["average_precision"],
                     "oof_roc_auc": metrics["roc_auc"],
                     "oof_brier": metrics["brier_score"],
@@ -269,7 +274,7 @@ def _compare_with_reference(
 
 def _save_selected_parameters(
     summary: pd.DataFrame,
-    spec_map: dict[str, TransferSearchSpec],
+    spec_map: dict[str, SearchSpec],
     confirmation_dir: Path,
 ) -> dict[str, Any] | None:
     selected: dict[str, Any] | None = None
@@ -278,7 +283,7 @@ def _save_selected_parameters(
         winner = summary.iloc[0]
         candidate = str(winner["candidate"])
         selected_parameters = spec_map[candidate].serialisable()
-        reference_parameters = REFERENCE_SPEC.serialisable()
+        reference_parameters = spec_map["reference"].serialisable()
 
         parameter_changes = [
             {
@@ -315,7 +320,7 @@ def _save_selected_parameters(
 def summarise_confirmation(
     folds: pd.DataFrame,
     oof: pd.DataFrame,
-    candidates: list[tuple[str, TransferSearchSpec]],
+    candidates: list[tuple[str, SearchSpec]],
     output_dir: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any] | None]:
     confirmation_dir = output_dir / "confirmation"

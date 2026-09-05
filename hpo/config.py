@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from modules.config import Config
 
@@ -65,6 +65,20 @@ REFERENCE_SPEC = TransferSearchSpec()
 
 @dataclass(frozen=True)
 class HPOConfig:
+    search_space: ClassVar[dict[str, Any]] = SEARCH_SPACE
+    reference_spec: ClassVar[TransferSearchSpec] = REFERENCE_SPEC
+    study_name: ClassVar[str] = "cbis_ddsm_efficientnetb0_cpu_hpo"
+    study_type: ClassVar[str] = "exploratory transfer-learning hyperparameter optimisation"
+    model_family: ClassVar[str] = "ImageNet EfficientNetB0"
+    trial_attributes: ClassVar[tuple[str, ...]] = ()
+    selection_filename: ClassVar[str | None] = None
+    epoch_fields: ClassVar[tuple[str, ...]] = (
+        "screen_head_epochs",
+        "screen_finetune_epochs",
+        "confirmation_head_epochs",
+        "confirmation_finetune_epochs",
+    )
+
     dataset_root: Path
     output_dir: Path
     program_name: str
@@ -99,6 +113,18 @@ class HPOConfig:
 
         return result
 
+    def training_epochs(self, confirmation: bool = False) -> dict[str, int]:
+        if confirmation:
+            return {
+                "head_epochs": self.confirmation_head_epochs,
+                "finetune_epochs": self.confirmation_finetune_epochs,
+            }
+
+        return {
+            "head_epochs": self.screen_head_epochs,
+            "finetune_epochs": self.screen_finetune_epochs,
+        }
+
     def experiment_config(self) -> Config:
         return Config(
             dataset_root=self.dataset_root,
@@ -122,7 +148,7 @@ class HPOConfig:
         )
 
 
-def _build_parser() -> argparse.ArgumentParser:
+def _build_parser(config_type: type = HPOConfig) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -133,19 +159,20 @@ def _build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--time-budget-hours", type=float, default=46.0)
     parser.add_argument("--search-budget-fraction", type=float, default=0.65)
-    parser.add_argument("--max-trials", type=int, default=60)
+    parser.add_argument("--max-trials", type=int, default=config_type.max_trials)
     parser.add_argument("--startup-trials", type=int, default=8)
 
     parser.add_argument("--screen-folds", type=int, default=2)
-    parser.add_argument("--confirmation-folds", type=int, default=3)
+    parser.add_argument("--confirmation-folds", type=int, default=config_type.confirmation_folds)
     parser.add_argument("--confirmation-top-k", type=int, default=2)
 
-    parser.add_argument("--screen-head-epochs", type=int, default=6)
-    parser.add_argument("--screen-finetune-epochs", type=int, default=8)
-    parser.add_argument("--confirmation-head-epochs", type=int, default=12)
-    parser.add_argument("--confirmation-finetune-epochs", type=int, default=18)
-    parser.add_argument("--screen-patience", type=int, default=3)
-    parser.add_argument("--confirmation-patience", type=int, default=5)
+    for name in config_type.epoch_fields:
+        parser.add_argument(
+            f"--{name.replace('_', '-')}", type=int, default=getattr(config_type, name)
+        )
+
+    parser.add_argument("--screen-patience", type=int, default=config_type.screen_patience)
+    parser.add_argument("--confirmation-patience", type=int, default=config_type.confirmation_patience)
 
     parser.add_argument("--calibration-fraction", type=float, default=0.15)
     parser.add_argument(
@@ -173,7 +200,11 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+def _validate_args(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    config_type: type = HPOConfig,
+) -> None:
     if args.image_size < 128:
         parser.error("--image-size < 128")
     if args.batch_size < 1:
@@ -194,10 +225,7 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--confirmation-top-k out of range")
 
     epoch_values = (
-        args.screen_head_epochs,
-        args.screen_finetune_epochs,
-        args.confirmation_head_epochs,
-        args.confirmation_finetune_epochs,
+        *(getattr(args, name) for name in config_type.epoch_fields),
         args.screen_patience,
         args.confirmation_patience,
     )
@@ -213,53 +241,42 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("Invalid overlap policy for lesion type")
 
 
-def _config_from_args(args: argparse.Namespace, program_name: str) -> HPOConfig:
+def _config_from_args(
+    args: argparse.Namespace,
+    program_name: str,
+    config_type: type = HPOConfig,
+) -> HPOConfig:
     output_root = args.output_dir.resolve()
     output_dir = output_root if output_root.name == program_name else output_root / program_name
 
-    return HPOConfig(
+    values = vars(args).copy()
+    values.update(
         dataset_root=args.dataset_root.resolve(),
         output_dir=output_dir,
         program_name=program_name,
-        image_size=args.image_size,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        time_budget_hours=args.time_budget_hours,
-        search_budget_fraction=args.search_budget_fraction,
-        max_trials=args.max_trials,
-        startup_trials=args.startup_trials,
-        screen_folds=args.screen_folds,
-        confirmation_folds=args.confirmation_folds,
-        confirmation_top_k=args.confirmation_top_k,
-        screen_head_epochs=args.screen_head_epochs,
-        screen_finetune_epochs=args.screen_finetune_epochs,
-        confirmation_head_epochs=args.confirmation_head_epochs,
-        confirmation_finetune_epochs=args.confirmation_finetune_epochs,
-        screen_patience=args.screen_patience,
-        confirmation_patience=args.confirmation_patience,
-        calibration_fraction=args.calibration_fraction,
-        cpu_threads=args.cpu_threads,
-        preload_images=args.preload_images,
-        lesion_type=args.lesion_type,
-        combined_patient_overlap_policy=args.combined_patient_overlap_policy,
-        include_benign_without_callback=args.include_benign_without_callback,
-        skip_confirmation=args.skip_confirmation,
     )
 
+    return config_type(**values)
 
-def parse_hpo_args(program_name: str) -> HPOConfig:
-    parser = _build_parser()
+
+def parse_hpo_args(program_name: str, config_type: type = HPOConfig) -> HPOConfig:
+    parser = _build_parser(config_type)
     args = parser.parse_args()
 
-    _validate_args(parser, args)
+    _validate_args(parser, args, config_type)
 
-    return _config_from_args(args, program_name)
+    return _config_from_args(args, program_name, config_type)
 
 
-def suggest_spec(trial: Any) -> TransferSearchSpec:
+def suggest_spec(
+    trial: Any,
+    reference_spec: Any = REFERENCE_SPEC,
+    search_space: dict[str, Any] = SEARCH_SPACE,
+) -> Any:
     parameters: dict[str, Any] = {}
 
-    for name, settings in SEARCH_SPACE.items():
+    for name in type(reference_spec).__dataclass_fields__:
+        settings = search_space[name]
         parameter_type = settings["type"]
         if parameter_type == "categorical":
             value = trial.suggest_categorical(name, settings["choices"])
@@ -275,13 +292,15 @@ def suggest_spec(trial: Any) -> TransferSearchSpec:
 
         parameters[name] = value
 
-    return TransferSearchSpec(**parameters)
+    return type(reference_spec)(**parameters)
 
 
-def spec_from_mapping(values: dict[str, Any]) -> TransferSearchSpec:
-    expected = set(TransferSearchSpec.__dataclass_fields__)
+def spec_from_mapping(
+    values: dict[str, Any], spec_type: type = TransferSearchSpec
+) -> Any:
+    expected = set(spec_type.__dataclass_fields__)
     missing = expected.difference(values)
     if missing:
         raise ValueError(f"Missing parameters: {sorted(missing)}")
 
-    return TransferSearchSpec(**{name: values[name] for name in expected})
+    return spec_type(**{name: values[name] for name in expected})

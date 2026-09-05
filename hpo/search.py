@@ -13,9 +13,11 @@ from modules.config import Config
 from modules.metrics import compute_metrics
 
 from .callbacks import DeadlineReached
-from .config import HPOConfig, REFERENCE_SPEC, TransferSearchSpec, suggest_spec
+from .config import suggest_spec
+from .regularized_config import SearchConfig, SearchSpec
+from .results import regularized_fold_summary
 from .runtime import optuna
-from .training import train_transfer_fold
+from .training import get_fold_trainer
 
 
 def _report_trial_progress(
@@ -23,8 +25,8 @@ def _report_trial_progress(
     fold_rows: list[dict[str, Any]],
     fold_number: int,
     splits: list[tuple[np.ndarray, np.ndarray]],
-    hpo_config: HPOConfig,
-    spec: TransferSearchSpec,
+    hpo_config: SearchConfig,
+    spec: SearchSpec,
 ) -> None:
     trial.set_user_attr("completed_folds", len(fold_rows))
 
@@ -41,13 +43,9 @@ def _report_trial_progress(
     if fold_number >= 2:
         trial.report(
             running_ap,
-            step=len(splits) * (
-                hpo_config.screen_head_epochs
-                + hpo_config.screen_finetune_epochs
-            )
-            + fold_number,
+            step=len(splits) * sum(hpo_config.training_epochs().values()) + fold_number,
         )
-        if spec != REFERENCE_SPEC and trial.should_prune():
+        if spec != hpo_config.reference_spec and trial.should_prune():
             raise optuna.TrialPruned(
                 f"Trial pruned after fold {fold_number}"
             )
@@ -87,12 +85,17 @@ def _save_trial_results(
     trial.set_user_attr("oof_roc_auc", oof_metrics["roc_auc"])
     trial.set_user_attr("oof_brier", oof_metrics["brier_score"])
 
+    model_summary = regularized_fold_summary(folds)
+    for name, value in model_summary.items():
+        trial.set_user_attr(name, value)
+
     write_json(
         trial_dir / "result.json",
         {
             "objective_mean_fold_average_precision": mean_ap,
             "mean_fold_roc_auc": float(folds["roc_auc"].mean()),
             "mean_fold_brier": float(folds["brier_score"].mean()),
+            **model_summary,
             "oof_metrics": oof_metrics,
         },
     )
@@ -105,7 +108,7 @@ def make_objective(
     development: pd.DataFrame,
     splits: list[tuple[np.ndarray, np.ndarray]],
     experiment_config: Config,
-    hpo_config: HPOConfig,
+    hpo_config: SearchConfig,
     preloaded: tuple[np.ndarray, np.ndarray] | None,
     search_deadline: float,
 ):
@@ -116,7 +119,8 @@ def make_objective(
         trial_dir = hpo_config.output_dir / "screen_trials" / f"trial_{trial.number:04d}"
         trial_dir.mkdir(parents=True, exist_ok=True)
 
-        spec = suggest_spec(trial)
+        spec = suggest_spec(trial, hpo_config.reference_spec, hpo_config.search_space)
+        train_fold = get_fold_trainer(spec)
         write_json(trial_dir / "parameters.json", spec.serialisable())
         LOGGER.info("Starting trial %d with parameters %s", trial.number, spec.serialisable())
 
@@ -128,7 +132,7 @@ def make_objective(
             for fold_number, (train_indices, validation_indices) in enumerate(
                 splits, start=1
             ):
-                row, probabilities = train_transfer_fold(
+                row, probabilities = train_fold(
                     spec=spec,
                     development=development,
                     train_indices=train_indices,
@@ -138,13 +142,12 @@ def make_objective(
                     fold_dir=trial_dir / f"fold_{fold_number}",
                     fold_number=fold_number,
                     total_folds=len(splits),
-                    head_epochs=hpo_config.screen_head_epochs,
-                    finetune_epochs=hpo_config.screen_finetune_epochs,
+                    **hpo_config.training_epochs(),
                     patience=hpo_config.screen_patience,
                     deadline=search_deadline,
                     preloaded=preloaded,
                     trial=trial,
-                    allow_pruning=spec != REFERENCE_SPEC,
+                    allow_pruning=spec != hpo_config.reference_spec,
                 )
 
                 row = {"trial": int(trial.number), **row}
@@ -175,7 +178,7 @@ def make_objective(
     return objective
 
 
-def load_or_create_study(hpo_config: HPOConfig) -> Any:
+def load_or_create_study(hpo_config: SearchConfig) -> Any:
     database_path = (hpo_config.output_dir / "study.db").resolve()
     storage_url = f"sqlite:///{database_path.as_posix()}"
 
@@ -191,7 +194,7 @@ def load_or_create_study(hpo_config: HPOConfig) -> Any:
     )
 
     study = optuna.create_study(
-        study_name="cbis_ddsm_efficientnetb0_cpu_hpo",
+        study_name=hpo_config.study_name,
         storage=storage_url,
         direction="maximize",
         sampler=sampler,
@@ -199,13 +202,13 @@ def load_or_create_study(hpo_config: HPOConfig) -> Any:
         load_if_exists=True,
     )
 
-    reference_parameters = REFERENCE_SPEC.serialisable()
+    reference_parameters = hpo_config.reference_spec.serialisable()
     reference_is_present = any(
         trial.params == reference_parameters
         and trial.state.name in {"COMPLETE", "RUNNING", "WAITING"}
         for trial in study.trials
     )
     if not reference_is_present:
-        study.enqueue_trial(REFERENCE_SPEC.serialisable())
+        study.enqueue_trial(hpo_config.reference_spec.serialisable())
 
     return study

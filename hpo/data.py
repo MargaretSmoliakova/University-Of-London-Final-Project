@@ -17,7 +17,7 @@ from modules.data_pipeline import make_dataset
 from modules.metadata import prepare_and_audit_data
 from modules.training import make_development_calibration_split, stratification_labels
 
-from .config import HPOConfig, SEARCH_SPACE
+from .regularized_config import SearchConfig
 
 
 def preload_images(
@@ -168,14 +168,14 @@ def development_fingerprint(development: pd.DataFrame) -> str:
 
 
 def ensure_study_contract(
-    hpo_config: HPOConfig,
+    hpo_config: SearchConfig,
     development: pd.DataFrame,
     screen_splits: list[tuple[np.ndarray, np.ndarray]],
 ) -> None:
     path = hpo_config.output_dir / "study_contract.json"
     contract = {
-        "study_type": "exploratory transfer-learning hyperparameter optimisation",
-        "model_family": "ImageNet EfficientNetB0",
+        "study_type": hpo_config.study_type,
+        "model_family": hpo_config.model_family,
         "primary_objective": "mean exact Average Precision across screen folds",
         "official_test_used_for_prediction_or_selection": False,
         "calibration_subset_used_for_prediction_or_selection": False,
@@ -184,13 +184,10 @@ def ensure_study_contract(
         "development_fingerprint": development_fingerprint(development),
         "screen_folds": hpo_config.screen_folds,
         "screen_validation_row_counts": [int(len(indices)) for _, indices in screen_splits],
-        "screen_head_epochs": hpo_config.screen_head_epochs,
-        "screen_finetune_epochs": hpo_config.screen_finetune_epochs,
+        **{name: getattr(hpo_config, name) for name in hpo_config.epoch_fields},
         "screen_patience": hpo_config.screen_patience,
         "confirmation_folds": hpo_config.confirmation_folds,
         "confirmation_top_k": hpo_config.confirmation_top_k,
-        "confirmation_head_epochs": hpo_config.confirmation_head_epochs,
-        "confirmation_finetune_epochs": hpo_config.confirmation_finetune_epochs,
         "confirmation_patience": hpo_config.confirmation_patience,
         "image_size": hpo_config.image_size,
         "batch_size": hpo_config.batch_size,
@@ -199,7 +196,7 @@ def ensure_study_contract(
         "lesion_type": hpo_config.lesion_type,
         "combined_patient_overlap_policy": hpo_config.combined_patient_overlap_policy,
         "include_benign_without_callback": hpo_config.include_benign_without_callback,
-        "search_space": SEARCH_SPACE,
+        "search_space": hpo_config.search_space,
     }
 
     if path.exists():
@@ -211,7 +208,7 @@ def ensure_study_contract(
 
 
 def prepare_hpo_data(
-    hpo_config: HPOConfig,
+    hpo_config: SearchConfig,
     experiment_config: Config,
 ) -> tuple[
     pd.DataFrame,
