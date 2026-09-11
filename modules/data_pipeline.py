@@ -27,6 +27,16 @@ def load_image_tensor(
     return image, tf.cast(label, tf.float32)
 
 
+def load_one_image_for_visualisation(image_path: str, image_size: int) -> np.ndarray:
+    pixels = percentile_window_to_255(read_pixel_array(image_path))[..., None]
+    image = tf.image.resize_with_pad(
+        pixels, image_size, image_size, method=tf.image.ResizeMethod.BILINEAR
+    )
+    image = tf.image.grayscale_to_rgb(image)
+
+    return np.asarray(image, dtype=np.float32)
+
+
 def make_dataset(
     metadata: pd.DataFrame,
     config: Config,
