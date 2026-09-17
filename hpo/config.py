@@ -65,13 +65,14 @@ REFERENCE_SPEC = TransferSearchSpec()
 
 @dataclass(frozen=True)
 class HPOConfig:
+    model_variant: ClassVar[str] = "transfer"
     search_space: ClassVar[dict[str, Any]] = SEARCH_SPACE
     reference_spec: ClassVar[TransferSearchSpec] = REFERENCE_SPEC
     study_name: ClassVar[str] = "cbis_ddsm_efficientnetb0_cpu_hpo"
     study_type: ClassVar[str] = "exploratory transfer-learning hyperparameter optimisation"
     model_family: ClassVar[str] = "ImageNet EfficientNetB0"
     trial_attributes: ClassVar[tuple[str, ...]] = ()
-    selection_filename: ClassVar[str | None] = None
+    selection_filename: ClassVar[str] = "selected_transfer_parameters.json"
     epoch_fields: ClassVar[tuple[str, ...]] = (
         "screen_head_epochs",
         "screen_finetune_epochs",

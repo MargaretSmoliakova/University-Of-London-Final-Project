@@ -55,6 +55,7 @@ REFERENCE_SPEC = RegularizedSearchSpec()
 
 @dataclass(frozen=True)
 class RegularizedHPOConfig:
+    model_variant: ClassVar[str] = "regularized"
     search_space: ClassVar[dict[str, Any]] = SEARCH_SPACE
     reference_spec: ClassVar[RegularizedSearchSpec] = REFERENCE_SPEC
     study_name: ClassVar[str] = "cbis_ddsm_regularized_cnn_cpu_hpo"

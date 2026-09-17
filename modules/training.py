@@ -160,7 +160,7 @@ def train_one_fold(
         head_epoch, head_pr_auc = best_epoch_and_value(head_history)
         model.load_weights(head_dir / "best.weights.h5")
 
-        enable_transfer_fine_tuning(model, config.fine_tune_last_layers)
+        enable_transfer_fine_tuning(model, config)
         fine_dir = fold_dir / "fine_tuning"
         fine_name = f"transfer fold {fold_number}/{config.folds} fine-tuning"
         LOGGER.info(
@@ -342,7 +342,7 @@ def train_final_model(
             verbose=2,
         )
         if bool(schedule["use_fine_tuning"]):
-            enable_transfer_fine_tuning(model, config.fine_tune_last_layers)
+            enable_transfer_fine_tuning(model, config)
             model.fit(
                 dataset,
                 epochs=int(schedule["fine_tune_epochs"]),

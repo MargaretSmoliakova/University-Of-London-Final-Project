@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
+
+from .hpo_selection import load_selection, selection_path, validate_hpo_settings
 
 
 @dataclass(frozen=True)
@@ -29,6 +32,8 @@ class Config:
     combined_patient_overlap_policy: str = "error"
     dataset_cache: str = "none"
     audit_only: bool = False
+    hpo_selections: dict[str, dict[str, Any]] = field(default_factory=dict)
+    hpo_selection_paths: dict[str, str] = field(default_factory=dict)
 
     def serialisable(self) -> dict[str, object]:
         result = asdict(self)
@@ -40,11 +45,7 @@ class Config:
 def parse_experiment_args(program_name: str) -> Config:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-root", required=True, type=Path)
-    parser.add_argument(
-        "--output-dir",
-        required=True,
-        type=Path,
-    )
+    parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument(
         "--models",
         nargs="+",
@@ -68,16 +69,12 @@ def parse_experiment_args(program_name: str) -> Config:
     parser.add_argument("--max-epochs-transfer-head", type=int, default=15)
     parser.add_argument("--max-epochs-transfer-finetune", type=int, default=20)
     parser.add_argument("--early-stopping-patience", type=int, default=7)
-    parser.add_argument("--fine-tune-last-layers", type=int, default=40)
+    parser.add_argument("--fine-tune-last-layers", type=int, default=None)
     parser.add_argument("--target-sensitivity", type=float, default=0.90)
     parser.add_argument("--bootstrap-repeats", type=int, default=2000)
     parser.add_argument("--calibration-fraction", type=float, default=0.15)
     parser.add_argument("--include-benign-without-callback", action="store_true")
-    parser.add_argument(
-        "--dataset-cache",
-        choices=("none", "memory"),
-        default="none",
-    )
+    parser.add_argument("--dataset-cache", choices=("none", "memory"), default="none")
     parser.add_argument("--audit-only", action="store_true")
     args = parser.parse_args()
 
@@ -95,13 +92,34 @@ def parse_experiment_args(program_name: str) -> Config:
         parser.error("--batch-size < 1")
     if args.early_stopping_patience < 1:
         parser.error("--early-stopping-patience < 1")
-    if args.fine_tune_last_layers < 1:
+    if args.fine_tune_last_layers is not None and args.fine_tune_last_layers < 1:
         parser.error("--fine-tune-last-layers < 1")
     if (
         args.combined_patient_overlap_policy == "exclude-train"
         and args.lesion_type != "both"
     ):
         parser.error("Invalid overlap policy for lesion type")
+
+    selections: dict[str, dict[str, Any]] = {}
+    selection_paths: dict[str, str] = {}
+    if not args.audit_only:
+        for model in ("regularized", "transfer"):
+            if model not in args.models:
+                continue
+            try:
+                selections[model] = load_selection(model)
+                validate_hpo_settings(selections[model], args)
+            except ValueError as exc:
+                parser.error(str(exc))
+            selection_paths[model] = str(selection_path(model))
+    fine_tune_last_layers = args.fine_tune_last_layers or 40
+    if "transfer" in selections:
+        fine_tune_last_layers = selections["transfer"]["parameters"]["fine_tune_last_layers"]
+        if args.fine_tune_last_layers not in (None, fine_tune_last_layers):
+            parser.error(
+                "--fine-tune-last-layers conflicts with selected_transfer_parameters.json; "
+                "omit this argument to use the HPO-selected value"
+            )
 
     output_root = args.output_dir.resolve()
     versioned_output = (
@@ -122,7 +140,7 @@ def parse_experiment_args(program_name: str) -> Config:
         max_epochs_transfer_head=args.max_epochs_transfer_head,
         max_epochs_transfer_finetune=args.max_epochs_transfer_finetune,
         early_stopping_patience=args.early_stopping_patience,
-        fine_tune_last_layers=args.fine_tune_last_layers,
+        fine_tune_last_layers=fine_tune_last_layers,
         target_sensitivity=args.target_sensitivity,
         bootstrap_repeats=args.bootstrap_repeats,
         calibration_fraction=args.calibration_fraction,
@@ -130,4 +148,6 @@ def parse_experiment_args(program_name: str) -> Config:
         combined_patient_overlap_policy=args.combined_patient_overlap_policy,
         dataset_cache=args.dataset_cache,
         audit_only=args.audit_only,
+        hpo_selections=selections,
+        hpo_selection_paths=selection_paths,
     )

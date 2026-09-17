@@ -9,6 +9,7 @@ import tensorflow as tf
 
 from .common import LOGGER, Thresholds, write_json
 from .config import Config
+from .hpo_selection import SELECTION_FILENAMES
 from .data_pipeline import make_dataset
 from .metadata import prepare_and_audit_data
 from .metrics import (
@@ -30,28 +31,54 @@ from .training import (
 
 
 def write_model_specifications(config: Config) -> None:
-    write_json(
-        config.output_dir / "model_specifications.json",
-        {
-            "baseline": {
-                "architecture": "four Conv2D-MaxPool blocks, GAP, Dense(128), sigmoid",
-                "learning_rate": 1e-3,
-                "augmentation": False,
-                "explicit_regularization": False,
-            },
-            "regularized": PRIMARY_REGULARIZATION.serialisable(),
-            "transfer": {
-                "backbone": "ImageNet EfficientNetB0",
-                "head_learning_rate": 1e-3,
-                "fine_tuning_learning_rate": 1e-5,
-                "fine_tune_last_layers": config.fine_tune_last_layers,
-                "batch_norm_frozen": True,
-                "head_dropout": [0.40, 0.25],
-                "head_l2": 1e-4,
-                "augmentation": True,
-            },
+    specifications = {
+        "baseline": {
+            "architecture": "four Conv2D-MaxPool blocks, GAP, Dense(128), sigmoid",
+            "learning_rate": 1e-3,
+            "augmentation": False,
+            "explicit_regularization": False,
         },
-    )
+        "regularized": PRIMARY_REGULARIZATION.serialisable(),
+        "transfer": {
+            "backbone": "ImageNet EfficientNetB0",
+            "head_learning_rate": 1e-3,
+            "fine_tuning_learning_rate": 1e-5,
+            "fine_tune_last_layers": config.fine_tune_last_layers,
+            "batch_norm_frozen": True,
+            "head_dropout": [0.40, 0.25],
+            "head_l2": 1e-4,
+            "augmentation": True,
+        },
+    }
+    for variant, selection in config.hpo_selections.items():
+        parameters = selection["parameters"]
+        if variant == "regularized":
+            specification = {
+                "name": "hpo_selected", "use_augmentation": True, **parameters,
+            }
+        else:
+            specification = {
+                "backbone": "ImageNet EfficientNetB0", "batch_norm_frozen": True,
+                **parameters,
+                "fine_tuning_learning_rate": parameters["fine_tune_learning_rate"],
+                "head_dropout": [parameters["head_dropout_1"], parameters["head_dropout_2"]],
+                "head_l2": parameters["l2_strength"],
+                "augmentation": {
+                    "horizontal_flip": True,
+                    **{key: parameters[key] for key in ("rotation", "translation", "zoom", "contrast")},
+                },
+            }
+        specification.update(
+            selection_source=config.hpo_selection_paths.get(variant),
+            selected_candidate=selection["candidate"],
+            official_test_used_for_selection=selection["official_test_used_for_selection"],
+            calibration_subset_used_for_selection=selection["calibration_subset_used_for_selection"],
+        )
+        specifications[variant] = specification
+        
+        write_json(config.output_dir / SELECTION_FILENAMES[variant], selection)
+        LOGGER.info("Using selected %s HPO candidate %s from %s", variant, selection["candidate"], config.hpo_selection_paths.get(variant))
+    write_json(config.output_dir / "model_specifications.json", specifications)
 
 
 def save_oof_results(variant: str, oof: pd.DataFrame, config: Config) -> Thresholds:
@@ -151,6 +178,10 @@ def save_test_predictions(
 
 
 def run_experiments(config: Config) -> None:
+    if not config.audit_only:
+        missing = set(config.models).intersection({"regularized", "transfer"}) - set(config.hpo_selections)
+        if missing:
+            raise ValueError(f"HPO selections were not loaded for {sorted(missing)}; run main_experiments.py to load the JSON files automatically")
     configure_runtime(config)
     write_json(config.output_dir / "config.json", config.serialisable())
     write_model_specifications(config)

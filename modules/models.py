@@ -4,6 +4,14 @@ from dataclasses import asdict, dataclass
 
 import tensorflow as tf
 
+from hpo.config import TransferSearchSpec
+from hpo.regularized_config import RegularizedSearchSpec
+from hpo.models import (
+    build_regularized_model as build_selected_regularized_model,
+    build_transfer_model as build_selected_transfer_model,
+    enable_fine_tuning as enable_selected_fine_tuning,
+)
+
 from .config import Config
 
 
@@ -54,6 +62,12 @@ def build_scratch_cnn(
     regularized: bool,
     specification: RegularizationSpec = PRIMARY_REGULARIZATION,
 ) -> tf.keras.Model:
+    if regularized and "regularized" in config.hpo_selections:
+        specification_from_hpo = RegularizedSearchSpec(
+            **config.hpo_selections["regularized"]["parameters"]
+        )
+        return build_selected_regularized_model(config, specification_from_hpo)
+
     inputs = tf.keras.Input((config.image_size, config.image_size, 3), name="image_0_255")
     features = inputs
     if regularized and specification.use_augmentation:
@@ -115,6 +129,10 @@ def build_scratch_cnn(
 
 
 def build_transfer_model(config: Config) -> tf.keras.Model:
+    if "transfer" in config.hpo_selections:
+        specification = TransferSearchSpec(**config.hpo_selections["transfer"]["parameters"])
+        return build_selected_transfer_model(config, specification)
+
     inputs = tf.keras.Input((config.image_size, config.image_size, 3), name="image_0_255")
     features = augmentation_layers()(inputs)
     backbone = tf.keras.applications.EfficientNetB0(
@@ -141,7 +159,12 @@ def build_transfer_model(config: Config) -> tf.keras.Model:
     return model
 
 
-def enable_transfer_fine_tuning(model: tf.keras.Model, last_layers: int) -> None:
+def enable_transfer_fine_tuning(model: tf.keras.Model, config: Config) -> None:
+    if "transfer" in config.hpo_selections:
+        specification = TransferSearchSpec(**config.hpo_selections["transfer"]["parameters"])
+        enable_selected_fine_tuning(model, specification)
+        return
+
     backbones = [
         layer
         for layer in model.layers
@@ -151,7 +174,7 @@ def enable_transfer_fine_tuning(model: tf.keras.Model, last_layers: int) -> None
         raise RuntimeError(f"Invalid backbone count: {len(backbones)}")
     backbone = backbones[0]
     backbone.trainable = True
-    cutoff = max(0, len(backbone.layers) - last_layers)
+    cutoff = max(0, len(backbone.layers) - config.fine_tune_last_layers)
     for index, layer in enumerate(backbone.layers):
         layer.trainable = index >= cutoff and not isinstance(
             layer, tf.keras.layers.BatchNormalization

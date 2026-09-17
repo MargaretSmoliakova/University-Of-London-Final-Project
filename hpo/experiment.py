@@ -21,6 +21,7 @@ from .plots import create_confirmation_plot
 from .results import save_live_trials, save_screen_analysis
 from .runtime import configure_cpu_threads, environment_summary, optuna
 from .search import load_or_create_study, make_objective
+from .selection import export_selected_parameters
 
 
 def _run_screening(
@@ -112,8 +113,9 @@ def _confirm_candidates(
             candidates,
             hpo_config.output_dir,
         )
-        if selected is not None and hpo_config.selection_filename is not None:
-            write_json(hpo_config.output_dir / hpo_config.selection_filename, selected)
+        if selected is not None:
+            selected, selection_file = export_selected_parameters(hpo_config, selected)
+            LOGGER.info("Selected %s parameters saved beside main_experiments.py: %s", hpo_config.model_variant, selection_file)
 
         create_confirmation_plot(
             confirmation_summary, confirmation_folds, hpo_config.output_dir
@@ -121,6 +123,8 @@ def _confirm_candidates(
     else:
         LOGGER.warning("Confirmation unavailable: no completed trials or time remaining")
 
+    if selected is None:
+        LOGGER.warning("No new confirmed selection was exported; any previous %s is unchanged", hpo_config.selection_filename)
     return confirmation_summary, selected
 
 
