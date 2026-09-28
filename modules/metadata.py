@@ -1,3 +1,10 @@
+"""
+Connect dataset records to mammogram images and check that they are usable.
+
+This module cleans metadata, locates lesion crops, checks for missing images and
+overlap between training and test data, and saves samples for visual review.
+"""
+
 from __future__ import annotations
 
 import re
@@ -21,13 +28,18 @@ from .dicom_io import file_sha256, inspect_dicom, percentile_window_to_255, read
 
 
 def normalise_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Standardise column names so metadata files can be read consistently."""
     result = frame.copy()
     result.columns = [str(column).strip().lower() for column in result.columns]
     return result
 
 
 class ImageResolver:
+    """Match metadata image references to usable lesion crops in the dataset."""
     def __init__(self, dataset_root: Path):
+        """
+        Index the available DICOM files so image references can be resolved efficiently.
+        """
         self.dataset_root = dataset_root
         self.by_case_id: dict[str, list[Path]] = {}
         self.case_ids_by_patient: dict[str, set[str]] = {}
@@ -61,6 +73,9 @@ class ImageResolver:
 
     @staticmethod
     def _uid_components(reference: str) -> set[str]:
+        """
+        Extract image identifiers from a reference path to help match it to local files.
+        """
         return {
             component
             for component in reference.replace("\\", "/").split("/")
@@ -69,6 +84,7 @@ class ImageResolver:
 
     @staticmethod
     def _series_uid(reference: str) -> str:
+        """Find the series identifier in an image reference for a fallback lookup."""
         components = [
             component
             for component in reference.replace("\\", "/").split("/")
@@ -77,6 +93,10 @@ class ImageResolver:
         return components[-1] if components else ""
 
     def _direct_candidates(self, reference: str) -> list[Path]:
+        """
+        Find local files that match the supplied image path or its case-specific
+        portion.
+        """
         normalised = reference.replace("\\", "/").lstrip("/")
         candidates: list[Path] = []
         direct = self.dataset_root / normalised
@@ -94,6 +114,12 @@ class ImageResolver:
         return list(dict.fromkeys(candidates))
 
     def resolve_crop(self, reference: Any) -> dict[str, Any]:
+        """
+        Choose a likely tissue crop for a metadata image reference.
+
+        Check matching files, exclude apparent masks, and return either the selected
+        image's details or information explaining why no image could be resolved.
+        """
         if pd.isna(reference):
             return {"image_path": None, "resolution_method": "missing_crop_reference"}
         reference_string = str(reference).strip()
@@ -157,6 +183,10 @@ class ImageResolver:
         direct_set = {str(path) for path in direct_candidates}
 
         def rank(info: DicomInfo) -> tuple[int, int, int, str]:
+            """
+            Prefer smaller tissue images, then direct path and identifier matches, when
+            choosing a crop.
+            """
             path_parts = set(Path(info.path).parts)
             uid_match = bool(uid_components.intersection(path_parts))
             return (
@@ -197,6 +227,10 @@ def load_one_metadata(
     official_split: str,
     include_benign_without_callback: bool,
 ) -> pd.DataFrame:
+    """
+    Read one metadata table and keep usable, labelled cases under the chosen inclusion
+    policy.
+    """
     path = dataset_root / filename
     if not path.exists():
         raise FileNotFoundError(f"Missing metadata: {filename}")
@@ -222,6 +256,7 @@ def load_one_metadata(
 
 
 def load_metadata(config: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load the official training and test records for the requested lesion types."""
     lesion_types = (
         tuple(METADATA_FILES)
         if config.lesion_type == "both"
@@ -255,6 +290,10 @@ def load_metadata(config: Config) -> tuple[pd.DataFrame, pd.DataFrame]:
 def resolve_metadata_images(
     metadata: pd.DataFrame, resolver: ImageResolver
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Attach local image details to metadata and separate records whose images cannot be
+    found.
+    """
     resolution = pd.DataFrame(
         [
             resolver.resolve_crop(reference)
@@ -269,6 +308,10 @@ def resolve_metadata_images(
 
 
 def split_summary(metadata: pd.DataFrame) -> dict[str, Any]:
+    """
+    Summarise a data split's size, patients, labels, and image-resolution results for
+    reporting.
+    """
     return {
         "rows": int(len(metadata)),
         "patients": int(metadata["patient_id"].nunique()),
@@ -285,6 +328,13 @@ def exclude_cross_lesion_patient_overlap_from_train(
     unresolved_train: pd.DataFrame,
     output_dir: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """
+    Remove training cases for patients also present in the other lesion type's test
+    data.
+
+    Record the exclusions and reject overlap within the same lesion type so the
+    combined dataset can keep its official test cases separate.
+    """
     overlap = sorted(set(train_metadata["patient_id"]) & set(test_metadata["patient_id"]))
     patient_details: list[dict[str, Any]] = []
     same_lesion_overlap: list[str] = []
@@ -381,6 +431,12 @@ def audit_dataset(
     output_dir: Path,
     official_split_adjustment: dict[str, Any] | None = None,
 ) -> None:
+    """
+    Check that training and test data are complete, consistent, and separate.
+
+    Save audit reports and stop on missing images, shared patients or images,
+    conflicting labels, duplicate rows, or absent classes.
+    """
     train_patients, test_patients = (
         set(train_metadata.patient_id),
         set(test_metadata.patient_id),
@@ -483,6 +539,10 @@ def audit_dataset(
 
 
 def save_visual_samples(metadata: pd.DataFrame, output_dir: Path, count: int = 24) -> None:
+    """
+    Save a selection of lesion images so their contents can be checked visually before
+    training.
+    """
     sample_dir = output_dir / "sample_check"
     sample_dir.mkdir(parents=True, exist_ok=True)
     if metadata.empty:
@@ -508,6 +568,12 @@ def save_visual_samples(metadata: pd.DataFrame, output_dir: Path, count: int = 2
 def prepare_and_audit_data(
     config: Config,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load the dataset, locate its images, apply the overlap policy, and run the data
+    checks.
+
+    Return the checked training and test records and save example images for review.
+    """
     train_raw, test_raw = load_metadata(config)
     resolver = ImageResolver(config.dataset_root)
     train, unresolved_train = resolve_metadata_images(train_raw, resolver)

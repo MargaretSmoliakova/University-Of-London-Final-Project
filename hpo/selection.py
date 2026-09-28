@@ -1,4 +1,10 @@
-"""Publish confirmed HPO parameters for automatic full-experiment loading."""
+"""
+Save confirmed model settings where the full experiment can load them.
+
+The exported files include the chosen parameters and the search settings needed
+to check that later experiments use compatible data preparation.
+"""
+
 from __future__ import annotations
 
 import json
@@ -16,6 +22,12 @@ def export_selected_parameters(
     selected: dict[str, Any],
     directory: Path | None = None,
 ) -> tuple[dict[str, Any], Path]:
+    """
+    Save confirmed model settings and their search context for the full experiment.
+
+    Write copies to the experiment's selection location and the search results
+    so the chosen candidate remains traceable.
+    """
     payload = {
         **selected,
         "selection_schema_version": 1,

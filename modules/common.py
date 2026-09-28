@@ -1,3 +1,10 @@
+"""
+Provide shared definitions and small helpers used throughout the project.
+
+This module keeps common dataset labels, image details, decision thresholds,
+logging, and JSON output handling in one place.
+"""
+
 from __future__ import annotations
 
 import json
@@ -33,6 +40,9 @@ UID_COMPONENT_PATTERN = re.compile(r"^\d+(?:\.\d+){3,}$")
 
 @dataclass(frozen=True)
 class DicomInfo:
+    """
+    Keep the image details needed to identify a DICOM file and assess its suitability.
+    """
     path: str
     rows: int
     columns: int
@@ -43,17 +53,22 @@ class DicomInfo:
 
     @property
     def area(self) -> int:
+        """Return the image's pixel count so candidate crops can be compared by size."""
         return self.rows * self.columns
 
 
 @dataclass(frozen=True)
 class Thresholds:
+    """Keep the decision cutoffs used to turn malignancy scores into predictions."""
     default: float
     youden_validation: float
     sensitivity_target_validation: float
 
 
 def json_default(value: Any) -> Any:
+    """
+    Convert paths and numerical values into forms that can be saved in JSON reports.
+    """
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, (np.integer, np.floating)):
@@ -64,6 +79,7 @@ def json_default(value: Any) -> Any:
 
 
 def write_json(path: Path, payload: Any) -> None:
+    """Save a readable JSON report, creating its destination folder when needed."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(payload, indent=2, default=json_default, ensure_ascii=False),

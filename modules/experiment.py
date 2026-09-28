@@ -1,3 +1,10 @@
+"""
+Coordinate the full comparison of mammogram classification models.
+
+The workflow audits data, compares models through cross-validation, trains final
+models, chooses decision thresholds, and evaluates the official test set.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -31,6 +38,7 @@ from .training import (
 
 
 def write_model_specifications(config: Config) -> None:
+    """Save the model designs and selected search settings used in this experiment."""
     specifications = {
         "baseline": {
             "architecture": "four Conv2D-MaxPool blocks, GAP, Dense(128), sigmoid",
@@ -82,6 +90,10 @@ def write_model_specifications(config: Config) -> None:
 
 
 def save_oof_results(variant: str, oof: pd.DataFrame, config: Config) -> Thresholds:
+    """
+    Save exploratory decision cutoffs from predictions made on held-out development
+    folds.
+    """
     exploratory_thresholds = select_validation_thresholds(
         oof["label"], oof["probability"], config.target_sensitivity
     )
@@ -106,6 +118,11 @@ def calibrate_final_model(
     calibration_metadata: pd.DataFrame,
     config: Config,
 ) -> tuple[np.ndarray, Thresholds]:
+    """
+    Choose final decision cutoffs using the reserved calibration patients.
+
+    Save their predictions and the selected thresholds for use in test evaluation.
+    """
     calibration_probability = final_model.predict(
         make_dataset(calibration_metadata, config, training=False), verbose=0
     ).ravel()
@@ -150,6 +167,9 @@ def save_test_predictions(
     thresholds: Thresholds,
     config: Config,
 ) -> None:
+    """
+    Save each test case's score, decisions, and error categories for later analysis.
+    """
     prediction_frame = test_metadata[
         [
             "patient_id",
@@ -178,6 +198,12 @@ def save_test_predictions(
 
 
 def run_experiments(config: Config) -> None:
+    """
+    Run the requested model comparison from data checks through final test reports.
+
+    Use development data for training, reserved calibration patients for decision
+    cutoffs, and the official test data for the final evaluation.
+    """
     if not config.audit_only:
         missing = set(config.models).intersection({"regularized", "transfer"}) - set(config.hpo_selections)
         if missing:

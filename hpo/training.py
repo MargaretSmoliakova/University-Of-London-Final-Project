@@ -1,3 +1,10 @@
+"""
+Train and evaluate individual candidates during screening and confirmation.
+
+These helpers run each validation fold, compare transfer-learning stages, and
+return the predictions and scores used to rank candidate settings.
+"""
+
 from __future__ import annotations
 
 import gc
@@ -23,11 +30,16 @@ from .regularized_config import RegularizedHPOConfig, RegularizedSearchSpec, Sea
 
 
 def predict_probabilities(model: tf.keras.Model, dataset: tf.data.Dataset) -> np.ndarray:
+    """Collect the model's malignancy scores for all images in a dataset."""
     return np.asarray(model.predict(dataset, verbose=0), dtype=float).ravel()
 
 
 @dataclass(frozen=True)
 class StageResult:
+    """
+    Keep a training stage's selected epoch, predictions, scores, and elapsed time
+    together.
+    """
     epoch: int
     pr_auc: float
     probabilities: np.ndarray
@@ -50,6 +62,9 @@ def _fit_training_stage(
     step_offset: int,
     allow_pruning: bool,
 ) -> StageResult:
+    """
+    Train one stage within its limits and evaluate the resulting validation predictions.
+    """
     started = time.perf_counter()
     history = model.fit(
         train_dataset,
@@ -84,6 +99,11 @@ def _fold_result(
     head: StageResult,
     fine: StageResult,
 ) -> tuple[dict[str, Any], np.ndarray]:
+    """
+    Choose the better transfer-learning stage by validation average precision.
+
+    Return its predictions with a record of both stages' scores and training time.
+    """
     if float(fine.metrics["average_precision"]) >= float(
         head.metrics["average_precision"]
     ):
@@ -135,6 +155,12 @@ def train_transfer_fold(
     trial: Any | None,
     allow_pruning: bool,
 ) -> tuple[dict[str, Any], np.ndarray]:
+    """
+    Train and evaluate a transfer-learning candidate on one validation fold.
+
+    Compare training the new classifier with adapting the pretrained layers, then
+    return the better stage's predictions and scores.
+    """
     tf.keras.backend.clear_session()
     trial_number = int(trial.number) if trial is not None else 10_000
     training_seed = hpo_config.seed + trial_number * 100 + fold_number
@@ -216,6 +242,12 @@ def train_regularized_fold(
     trial: Any | None,
     allow_pruning: bool,
 ) -> tuple[dict[str, Any], np.ndarray]:
+    """
+    Train and evaluate a regularized candidate on one validation fold.
+
+    Return its predictions, performance, training duration, and model size for
+    comparison with other candidates.
+    """
     tf.keras.backend.clear_session()
     trial_number = int(trial.number) if trial is not None else 10_000
     training_seed = hpo_config.seed + fold_number
@@ -286,6 +318,7 @@ def train_regularized_fold(
 
 
 def get_fold_trainer(spec: SearchSpec):
+    """Choose the fold-training routine that matches the candidate's model type."""
     if isinstance(spec, RegularizedSearchSpec):
         return train_regularized_fold
 

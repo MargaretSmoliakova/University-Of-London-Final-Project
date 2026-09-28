@@ -1,3 +1,10 @@
+"""
+Measure how well models distinguish benign and malignant lesions.
+
+These helpers choose decision thresholds, summarise prediction quality, estimate
+uncertainty, and compare models and lesion types.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -22,12 +29,21 @@ from .common import Thresholds
 
 
 def safe_ratio(numerator: int, denominator: int) -> float:
+    """
+    Calculate a ratio, returning an unavailable value when its denominator is zero.
+    """
     return float(numerator / denominator) if denominator else float("nan")
 
 
 def compute_metrics(
     true_labels: Sequence[int], probabilities: Sequence[float], threshold: float
 ) -> dict[str, float | int]:
+    """
+    Summarise prediction quality using malignancy scores and a chosen decision cutoff.
+
+    Include overall scores and counts of correct predictions, missed cancers,
+    and false alarms.
+    """
     y_true = np.asarray(true_labels, dtype=int)
     y_probability = np.asarray(probabilities, dtype=float)
     predicted = (y_probability >= threshold).astype(int)
@@ -65,6 +81,12 @@ def compute_metrics(
 def select_validation_thresholds(
     true_labels: Sequence[int], probabilities: Sequence[float], target_sensitivity: float
 ) -> Thresholds:
+    """
+    Choose decision cutoffs from validation predictions for later evaluation.
+
+    Keep the default cutoff and select alternatives that balance sensitivity
+    and specificity or meet the requested sensitivity.
+    """
     y_true = np.asarray(true_labels, dtype=int)
     y_probability = np.asarray(probabilities, dtype=float)
     fpr, tpr, thresholds = roc_curve(y_true, y_probability, drop_intermediate=False)
@@ -89,6 +111,7 @@ def select_validation_thresholds(
 def save_operating_points(
     true_labels: Sequence[int], probabilities: Sequence[float], output_path: Path
 ) -> None:
+    """Save how sensitivity and specificity change across possible decision cutoffs."""
     y_true = np.asarray(true_labels, dtype=int)
     y_probability = np.asarray(probabilities, dtype=float)
     fpr, tpr, thresholds = roc_curve(y_true, y_probability, drop_intermediate=False)
@@ -110,6 +133,10 @@ def threshold_rows(
     probabilities: np.ndarray,
     thresholds: Thresholds,
 ) -> list[dict[str, Any]]:
+    """
+    Build performance-report rows for each decision rule on a named model and data
+    split.
+    """
     return [
         {
             "model": model_name,
@@ -128,6 +155,12 @@ def bootstrap_confidence_intervals(
     repeats: int,
     seed: int,
 ) -> pd.DataFrame:
+    """
+    Estimate uncertainty in performance by repeatedly resampling whole patients.
+
+    Keeping each patient's images together preserves their grouping when calculating
+    confidence intervals.
+    """
     groups = metadata["patient_id"].astype(str).to_numpy()
     unique_groups = np.unique(groups)
     group_indices = {group: np.flatnonzero(groups == group) for group in unique_groups}
@@ -182,6 +215,7 @@ def subgroup_rows(
     probabilities: np.ndarray,
     thresholds: Thresholds,
 ) -> list[dict[str, Any]]:
+    """Report prediction quality separately for each lesion type and decision rule."""
     rows: list[dict[str, Any]] = []
     for lesion_type, indices in test_metadata.groupby("lesion_type").groups.items():
         subset = test_metadata.loc[indices]
@@ -204,6 +238,11 @@ def paired_auc_bootstrap(
     repeats: int,
     seed: int,
 ) -> pd.DataFrame:
+    """
+    Compare model scores using the same resampled patients for each pair.
+
+    Estimate the difference in class-separation performance and its uncertainty.
+    """
     if len(prediction_columns) < 2:
         return pd.DataFrame()
     groups = test_metadata["patient_id"].astype(str).to_numpy()

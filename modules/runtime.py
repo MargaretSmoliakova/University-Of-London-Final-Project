@@ -1,3 +1,10 @@
+"""
+Prepare logging and repeatable random choices for an experiment.
+
+The runtime setup creates the output location and requests reproducible training
+behaviour where the underlying tools support it.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -11,6 +18,10 @@ from .config import Config
 
 
 def configure_runtime(config: Config) -> None:
+    """
+    Create the output folder, set up logging, and seed random choices for a repeatable
+    run.
+    """
     config.output_dir.mkdir(parents=True, exist_ok=True)
     root_logger = logging.getLogger()
     for handler in list(root_logger.handlers):

@@ -1,3 +1,10 @@
+"""
+Define the settings used to search for a transfer-learning model.
+
+This module describes the candidate settings and reference model, reads search
+options from the command line, and prepares settings for individual trials.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -41,6 +48,7 @@ SEARCH_SPACE = {
 
 @dataclass(frozen=True)
 class TransferSearchSpec:
+    """Describe one candidate set of settings for adapting the pretrained model."""
     head_learning_rate: float = 1e-3
     fine_tune_learning_rate: float = 1e-5
     dense_units: int = 128
@@ -57,6 +65,7 @@ class TransferSearchSpec:
     pooling: str = "average"
 
     def serialisable(self) -> dict[str, Any]:
+        """Prepare this candidate's model settings for saving and comparison."""
         return asdict(self)
 
 
@@ -65,6 +74,10 @@ REFERENCE_SPEC = TransferSearchSpec()
 
 @dataclass(frozen=True)
 class HPOConfig:
+    """
+    Keep the data choices, search limits, and confirmation plan for a transfer-learning
+    search.
+    """
     model_variant: ClassVar[str] = "transfer"
     search_space: ClassVar[dict[str, Any]] = SEARCH_SPACE
     reference_spec: ClassVar[TransferSearchSpec] = REFERENCE_SPEC
@@ -108,6 +121,7 @@ class HPOConfig:
     skip_confirmation: bool = False
 
     def serialisable(self) -> dict[str, Any]:
+        """Prepare the search configuration for saving alongside its results."""
         result = asdict(self)
         result["dataset_root"] = str(self.dataset_root)
         result["output_dir"] = str(self.output_dir)
@@ -115,6 +129,10 @@ class HPOConfig:
         return result
 
     def training_epochs(self, confirmation: bool = False) -> dict[str, int]:
+        """
+        Choose the training limits for screening or the more thorough confirmation
+        stage.
+        """
         if confirmation:
             return {
                 "head_epochs": self.confirmation_head_epochs,
@@ -127,6 +145,9 @@ class HPOConfig:
         }
 
     def experiment_config(self) -> Config:
+        """
+        Translate the search settings for use by the shared data and experiment helpers.
+        """
         return Config(
             dataset_root=self.dataset_root,
             output_dir=self.output_dir,
@@ -150,6 +171,9 @@ class HPOConfig:
 
 
 def _build_parser(config_type: type = HPOConfig) -> argparse.ArgumentParser:
+    """
+    Define the command-line choices available for the selected type of model search.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
@@ -206,6 +230,10 @@ def _validate_args(
     args: argparse.Namespace,
     config_type: type = HPOConfig,
 ) -> None:
+    """
+    Reject search options that fall outside the supported ranges or conflict with each
+    other.
+    """
     if args.image_size < 128:
         parser.error("--image-size < 128")
     if args.batch_size < 1:
@@ -247,6 +275,9 @@ def _config_from_args(
     program_name: str,
     config_type: type = HPOConfig,
 ) -> HPOConfig:
+    """
+    Build the search configuration and resolve where its input data and results belong.
+    """
     output_root = args.output_dir.resolve()
     output_dir = output_root if output_root.name == program_name else output_root / program_name
 
@@ -261,6 +292,9 @@ def _config_from_args(
 
 
 def parse_hpo_args(program_name: str, config_type: type = HPOConfig) -> HPOConfig:
+    """
+    Read and check command-line options, then return the configuration for the search.
+    """
     parser = _build_parser(config_type)
     args = parser.parse_args()
 
@@ -274,6 +308,7 @@ def suggest_spec(
     reference_spec: Any = REFERENCE_SPEC,
     search_space: dict[str, Any] = SEARCH_SPACE,
 ) -> Any:
+    """Ask the search trial to choose a candidate from the allowed model settings."""
     parameters: dict[str, Any] = {}
 
     for name in type(reference_spec).__dataclass_fields__:
@@ -299,6 +334,10 @@ def suggest_spec(
 def spec_from_mapping(
     values: dict[str, Any], spec_type: type = TransferSearchSpec
 ) -> Any:
+    """
+    Rebuild a candidate's settings from saved values, checking that all required choices
+    are present.
+    """
     expected = set(spec_type.__dataclass_fields__)
     missing = expected.difference(values)
     if missing:

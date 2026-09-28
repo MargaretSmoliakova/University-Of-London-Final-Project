@@ -1,3 +1,10 @@
+"""
+Track training progress and manage when training should stop or adjust.
+
+These callbacks record timing and scores, save the best model weights, and keep
+logs available while experiments are running.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -14,15 +21,24 @@ from .config import Config
 
 
 class EpochTiming(tf.keras.callbacks.Callback):
+    """Record how long each training epoch takes and report its scores."""
     def __init__(self, stage_name: str):
+        """
+        Remember the training stage name so timing messages identify the current work.
+        """
         super().__init__()
         self.stage_name = stage_name
         self.started = 0.0
 
     def on_epoch_begin(self, epoch: int, logs: dict[str, Any] | None = None) -> None:
+        """Start the timer for the next pass through the training data."""
         self.started = time.perf_counter()
 
     def on_epoch_end(self, epoch: int, logs: dict[str, Any] | None = None) -> None:
+        """
+        Report the completed epoch's duration and scores, then write pending log
+        messages.
+        """
         elapsed = time.perf_counter() - self.started
         values = logs or {}
         metrics = ", ".join(
@@ -41,6 +57,9 @@ class EpochTiming(tf.keras.callbacks.Callback):
 
 
 def flush_python_log_handlers() -> None:
+    """
+    Write pending log messages to their destinations so progress is visible promptly.
+    """
     seen: set[int] = set()
     for logger in (logging.getLogger(), LOGGER):
         for handler in logger.handlers:
@@ -57,7 +76,11 @@ def flush_python_log_handlers() -> None:
 
 
 class ImmediateCSVLogger(tf.keras.callbacks.CSVLogger):
+    """Keep the training history file up to date after every epoch."""
     def on_epoch_end(self, epoch: int, logs: dict[str, Any] | None = None) -> None:
+        """
+        Save the latest epoch's scores and flush the history file for immediate review.
+        """
         super().on_epoch_end(epoch, logs)
         csv_file = getattr(self, "csv_file", None)
         if csv_file is not None:
@@ -71,6 +94,12 @@ class ImmediateCSVLogger(tf.keras.callbacks.CSVLogger):
 def callbacks_for_stage(
     config: Config, stage_dir: Path, stage_name: str
 ) -> list[tf.keras.callbacks.Callback]:
+    """
+    Set up progress logging and validation-based controls for a training stage.
+
+    Save the best weights, stop when improvement stalls, and reduce the learning
+    rate when needed.
+    """
     stage_dir.mkdir(parents=True, exist_ok=True)
     return [
         EpochTiming(stage_name),
@@ -102,6 +131,7 @@ def callbacks_for_stage(
 def callbacks_for_final_stage(
     stage_dir: Path, stage_name: str
 ) -> list[tf.keras.callbacks.Callback]:
+    """Set up timing, history logging, and invalid-value checks for final training."""
     stage_dir.mkdir(parents=True, exist_ok=True)
     return [
         EpochTiming(stage_name),
@@ -111,6 +141,9 @@ def callbacks_for_final_stage(
 
 
 def best_epoch_and_value(history: tf.keras.callbacks.History) -> tuple[int, float]:
+    """
+    Find the epoch with the strongest validation precision-recall score and return both.
+    """
     values = np.asarray(history.history["val_pr_auc"], dtype=float)
     best_index = int(np.nanargmax(values))
     return best_index + 1, float(values[best_index])
@@ -119,6 +152,9 @@ def best_epoch_and_value(history: tf.keras.callbacks.History) -> tuple[int, floa
 def report_stage_quality(
     history: tf.keras.callbacks.History, stage_name: str, validation_metadata
 ) -> None:
+    """
+    Summarise the best validation scores and flag weak class separation for review.
+    """
     best_epoch, best_pr_auc = best_epoch_and_value(history)
     roc_values = np.asarray(history.history["val_roc_auc"], dtype=float)
     best_roc_auc = float(np.nanmax(roc_values))

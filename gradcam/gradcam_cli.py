@@ -1,3 +1,10 @@
+"""
+Run Grad-CAM visual explanations from saved experiment results.
+
+This module reads command-line settings, loads a trained model and its test
+predictions, and creates explanation images without retraining the model.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -14,6 +21,7 @@ from .gradcam import generate_gradcam_artifacts
 
 
 def parse_gradcam_args(program_name: str) -> argparse.Namespace:
+    """Read and check the command-line choices for generating explanation images."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", required=True, type=Path)
     parser.add_argument(
@@ -43,6 +51,10 @@ def parse_gradcam_args(program_name: str) -> argparse.Namespace:
 
 
 def configure_gradcam_logging(output_dir: Path) -> None:
+    """
+    Create the explanation output folder and record progress on screen and in a log
+    file.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logging.basicConfig(
@@ -57,6 +69,12 @@ def configure_gradcam_logging(output_dir: Path) -> None:
 
 
 def run_gradcam(args: argparse.Namespace) -> None:
+    """
+    Load a completed model and its saved test results, then generate visual
+    explanations.
+
+    Check the required files and image size before producing the selected panels.
+    """
     configure_gradcam_logging(args.output_dir)
 
     model_dir = args.results_dir / args.model

@@ -1,3 +1,10 @@
+"""
+Prepare mammogram images for training, prediction, and visual review.
+
+These helpers load images, adjust their intensity range and size, and arrange
+them into batches while keeping each image paired with its label.
+"""
+
 from __future__ import annotations
 
 import numpy as np
@@ -10,6 +17,9 @@ from .dicom_io import percentile_window_to_255, read_pixel_array
 
 
 def _numpy_load_image(path_bytes: bytes) -> np.ndarray:
+    """
+    Read an image from its stored path and prepare its brightness for the data pipeline.
+    """
     path = path_bytes.decode("utf-8")
     return percentile_window_to_255(read_pixel_array(path))[..., None]
 
@@ -17,6 +27,11 @@ def _numpy_load_image(path_bytes: bytes) -> np.ndarray:
 def load_image_tensor(
     image_path: tf.Tensor, label: tf.Tensor, image_size: int
 ) -> tuple[tf.Tensor, tf.Tensor]:
+    """
+    Load and resize one image into the format expected by the models.
+
+    Preserve its proportions with padding and keep it paired with its label.
+    """
     image = tf.numpy_function(_numpy_load_image, [image_path], tf.float32)
     image.set_shape((None, None, 1))
     image = tf.image.resize_with_pad(
@@ -28,6 +43,10 @@ def load_image_tensor(
 
 
 def load_one_image_for_visualisation(image_path: str, image_size: int) -> np.ndarray:
+    """
+    Prepare one image as it would appear to a model so visual explanations align with
+    it.
+    """
     pixels = percentile_window_to_255(read_pixel_array(image_path))[..., None]
     image = tf.image.resize_with_pad(
         pixels, image_size, image_size, method=tf.image.ResizeMethod.BILINEAR
@@ -43,6 +62,12 @@ def make_dataset(
     training: bool,
     seed_offset: int = 0,
 ) -> tf.data.Dataset:
+    """
+    Arrange labelled images into batches for training or prediction.
+
+    Optionally keep loaded images in memory and shuffle training examples between
+    passes through the data.
+    """
     paths = metadata["image_path"].astype(str).to_numpy()
     labels = metadata["label"].astype(np.float32).to_numpy()
     dataset = tf.data.Dataset.from_tensor_slices((paths, labels))

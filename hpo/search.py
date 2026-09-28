@@ -1,3 +1,10 @@
+"""
+Run and track trials that compare candidate model settings.
+
+This module manages a saved search study, evaluates each candidate across
+validation groups, and records scores, progress, and failures.
+"""
+
 from __future__ import annotations
 
 import time
@@ -28,6 +35,9 @@ def _report_trial_progress(
     hpo_config: SearchConfig,
     spec: SearchSpec,
 ) -> None:
+    """
+    Report scores after a fold and allow weak non-reference candidates to stop early.
+    """
     trial.set_user_attr("completed_folds", len(fold_rows))
 
     running_ap = float(np.mean([item["average_precision"] for item in fold_rows]))
@@ -59,6 +69,9 @@ def _save_trial_results(
     oof_probability: np.ndarray,
     oof_fold: np.ndarray,
 ) -> float:
+    """
+    Save a completed trial's predictions and scores, then return its ranking score.
+    """
     if np.isnan(oof_probability).any():
         raise RuntimeError(f"Incomplete OOF predictions: trial {trial.number}")
 
@@ -112,7 +125,14 @@ def make_objective(
     preloaded: tuple[np.ndarray, np.ndarray] | None,
     search_deadline: float,
 ):
+    """Create the evaluation routine that the search will call for each candidate."""
     def objective(trial: Any) -> float:
+        """
+        Train and score one candidate across the screening folds.
+
+        Save its progress and predictions, respect the time limit, and record failures
+        so the search can account for unsuccessful trials.
+        """
         if time.time() >= search_deadline:
             raise optuna.TrialPruned("Search time budget reached")
 
@@ -179,6 +199,13 @@ def make_objective(
 
 
 def load_or_create_study(hpo_config: SearchConfig) -> Any:
+    """
+    Open a saved search or start a new one with the configured sampling and stopping
+    rules.
+
+    Ensure the reference settings are scheduled when no active or completed trial
+    already covers them.
+    """
     database_path = (hpo_config.output_dir / "study.db").resolve()
     storage_url = f"sqlite:///{database_path.as_posix()}"
 

@@ -1,3 +1,10 @@
+"""
+Create visual explanations of a model's mammogram predictions.
+
+These helpers select examples of correct and incorrect predictions, highlight
+regions contributing to the malignancy score, and save panels for review.
+"""
+
 from __future__ import annotations
 
 import re
@@ -14,6 +21,9 @@ from modules.data_pipeline import load_one_image_for_visualisation
 
 
 def find_gradcam_target_layer(model: tf.keras.Model) -> tf.keras.layers.Layer:
+    """
+    Choose a late image-feature layer suitable for explaining the model's prediction.
+    """
     for layer in reversed(model.layers):
         if isinstance(layer, tf.keras.Model) and "efficientnet" in layer.name.lower():
             return layer
@@ -30,6 +40,11 @@ def make_gradcam_heatmap(
     image: np.ndarray,
     target_layer: tf.keras.layers.Layer,
 ) -> tuple[np.ndarray, float]:
+    """
+    Highlight image regions that contribute to the model's malignancy score.
+
+    Return the relative emphasis map and the score computed for that image.
+    """
     image_batch = tf.convert_to_tensor(image[None, ...], dtype=tf.float32)
 
     with tf.GradientTape() as tape:
@@ -67,6 +82,9 @@ def make_gradcam_heatmap(
 
 
 def _colour_heatmap(heatmap: np.ndarray) -> np.ndarray:
+    """
+    Turn heatmap strengths into colours so highlighted regions are easy to distinguish.
+    """
     intensity = np.clip(heatmap, 0.0, 1.0)
     red = np.clip(1.5 - np.abs(4.0 * intensity - 3.0), 0.0, 1.0)
     green = np.clip(1.5 - np.abs(4.0 * intensity - 2.0), 0.0, 1.0)
@@ -81,6 +99,9 @@ def _make_panel(
     title: str,
     alpha: float,
 ) -> Image.Image:
+    """
+    Place the original image, heatmap, and blended overlay side by side with a caption.
+    """
     image_size = int(base_image.shape[0])
     pixels = np.clip(base_image, 0, 255).astype(np.uint8)
     original_image = Image.fromarray(pixels, mode="RGB")
@@ -118,6 +139,12 @@ def select_explanation_rows(
     maximum_samples: int,
     seed: int,
 ) -> pd.DataFrame:
+    """
+    Choose examples across lesion types and correct and incorrect prediction outcomes.
+
+    Spread the selection across available groups so visual review covers a variety
+    of model behaviours.
+    """
     frame = metadata.reset_index(drop=True).copy()
     frame["probability"] = probabilities
     frame["prediction"] = (probabilities >= threshold).astype(int)
@@ -167,6 +194,12 @@ def _save_gradcam_panel(
     youden_threshold: float,
     alpha: float,
 ) -> dict[str, Any]:
+    """
+    Save one case's visual explanation and return the details needed for its image
+    record.
+
+    Also compare the recomputed score with the saved prediction to flag discrepancies.
+    """
     image = load_one_image_for_visualisation(str(row.image_path), image_size)
     heatmap, checked_probability = make_gradcam_heatmap(model, image, target_layer)
     probability_difference = abs(checked_probability - float(row.probability))
@@ -218,6 +251,12 @@ def generate_gradcam_artifacts(
     alpha: float,
     seed: int,
 ) -> pd.DataFrame:
+    """
+    Create explanation panels for a selection of test cases.
+
+    Save a table linking the images to their predictions and notes describing
+    how the explanations were produced.
+    """
     if maximum_samples <= 0:
         return pd.DataFrame()
 

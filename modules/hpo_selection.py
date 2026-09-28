@@ -1,3 +1,10 @@
+"""
+Manage the selected model settings shared by searches and full experiments.
+
+This module checks saved selections, verifies compatible experiment settings,
+and loads or saves the files used to reproduce the chosen models.
+"""
+
 from __future__ import annotations
 
 import json
@@ -34,14 +41,20 @@ PARAMETER_TYPES = {
 
 
 def project_directory() -> Path:
+    """Locate the project folder where selected model settings are normally stored."""
     return Path(__file__).resolve().parents[1]
 
 
 def selection_path(model: str, directory: Path | None = None) -> Path:
+    """Find the selected-parameters file for a model in the chosen folder."""
     return (directory if directory is not None else project_directory()) / SELECTION_FILENAMES[model]
 
 
 def validate_selection(payload: Any, model: str) -> dict[str, Any]:
+    """
+    Check that saved model settings are complete, valid, and marked as selected without
+    reserved data.
+    """
     if not isinstance(payload, dict):
         raise ValueError("The selection JSON must contain an object")
     if payload.get("model_variant", model) != model:
@@ -92,6 +105,9 @@ def validate_selection(payload: Any, model: str) -> dict[str, Any]:
 
 
 def load_selection(model: str, directory: Path | None = None) -> dict[str, Any]:
+    """
+    Read and validate a model's selected settings, explaining missing or unusable files.
+    """
     path = selection_path(model, directory)
     try:
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -109,6 +125,10 @@ def load_selection(model: str, directory: Path | None = None) -> dict[str, Any]:
 
 
 def validate_hpo_settings(payload: dict[str, Any], settings: Any) -> None:
+    """
+    Check that the full experiment matches the recorded data and setup choices used
+    during the search.
+    """
     recorded = payload.get("hpo_settings", {})
     differences = [
         f"{name}: HPO={recorded[name]!r}, full run={getattr(settings, name)!r}"
@@ -120,6 +140,10 @@ def validate_hpo_settings(payload: dict[str, Any], settings: Any) -> None:
 
 
 def save_selection(model: str, payload: dict[str, Any], directory: Path | None = None) -> Path:
+    """
+    Validate and save selected settings, replacing the destination only after the new
+    file is written.
+    """
     from .common import write_json
 
     validate_selection(payload, model)

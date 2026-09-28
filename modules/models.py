@@ -1,3 +1,10 @@
+"""
+Build the baseline, regularized, and transfer-learning mammogram classifiers.
+
+This module applies selected search settings when available, prepares models for
+training, and provides weights to balance benign and malignant training examples.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -17,6 +24,10 @@ from .config import Config
 
 @dataclass(frozen=True)
 class RegularizationSpec:
+    """
+    Describe the default measures used to reduce overfitting in a model trained from
+    scratch.
+    """
     name: str = "primary_regularized"
     l2_strength: float = 1e-4
     spatial_dropout: float = 0.10
@@ -26,6 +37,9 @@ class RegularizationSpec:
     use_batch_norm: bool = True
 
     def serialisable(self) -> dict[str, object]:
+        """
+        Prepare the regularization settings for inclusion in saved model descriptions.
+        """
         return asdict(self)
 
 
@@ -33,6 +47,10 @@ PRIMARY_REGULARIZATION = RegularizationSpec()
 
 
 def augmentation_layers() -> tf.keras.Sequential:
+    """
+    Create small random image variations to help the model learn beyond the training
+    examples.
+    """
     return tf.keras.Sequential(
         [
             tf.keras.layers.RandomFlip("horizontal"),
@@ -46,6 +64,10 @@ def augmentation_layers() -> tf.keras.Sequential:
 
 
 def compile_binary_model(model: tf.keras.Model, learning_rate: float) -> None:
+    """
+    Prepare a model to learn benign versus malignant labels and track prediction
+    quality.
+    """
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
         loss=tf.keras.losses.BinaryCrossentropy(),
@@ -62,6 +84,12 @@ def build_scratch_cnn(
     regularized: bool,
     specification: RegularizationSpec = PRIMARY_REGULARIZATION,
 ) -> tf.keras.Model:
+    """
+    Create a mammogram classifier that learns its image features from scratch.
+
+    Build the baseline or regularized version, using selected search settings
+    for the regularized model when available.
+    """
     if regularized and "regularized" in config.hpo_selections:
         specification_from_hpo = RegularizedSearchSpec(
             **config.hpo_selections["regularized"]["parameters"]
@@ -129,6 +157,12 @@ def build_scratch_cnn(
 
 
 def build_transfer_model(config: Config) -> tf.keras.Model:
+    """
+    Create a mammogram classifier based on a pretrained image model.
+
+    Start with its learned image features fixed while a new classifier is trained,
+    using selected search settings when available.
+    """
     if "transfer" in config.hpo_selections:
         specification = TransferSearchSpec(**config.hpo_selections["transfer"]["parameters"])
         return build_selected_transfer_model(config, specification)
@@ -160,6 +194,10 @@ def build_transfer_model(config: Config) -> tf.keras.Model:
 
 
 def enable_transfer_fine_tuning(model: tf.keras.Model, config: Config) -> None:
+    """
+    Allow the later pretrained layers to adapt to mammograms with a smaller learning
+    rate.
+    """
     if "transfer" in config.hpo_selections:
         specification = TransferSearchSpec(**config.hpo_selections["transfer"]["parameters"])
         enable_selected_fine_tuning(model, specification)
@@ -183,6 +221,10 @@ def enable_transfer_fine_tuning(model: tf.keras.Model, config: Config) -> None:
 
 
 def balanced_class_weights(metadata) -> dict[int, float]:
+    """
+    Give the less common training class more weight so both classes contribute equally
+    overall.
+    """
     counts = metadata["label"].value_counts().sort_index()
     if set(counts.index) != {0, 1}:
         raise ValueError("Missing training class")

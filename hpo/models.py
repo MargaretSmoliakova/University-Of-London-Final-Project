@@ -1,3 +1,10 @@
+"""
+Build mammogram classifiers with settings supplied by the search.
+
+This module creates models trained from scratch or adapted from a pretrained
+model, along with image variations and training settings for each candidate.
+"""
+
 from __future__ import annotations
 
 import tensorflow as tf
@@ -11,6 +18,10 @@ from .regularized_config import RegularizedSearchSpec, SearchSpec
 def create_augmentation(
     spec: SearchSpec, name: str = "hpo_training_only_augmentation"
 ) -> tf.keras.Sequential:
+    """
+    Create the candidate's random image variations to help reduce overfitting during
+    training.
+    """
     layers: list[tf.keras.layers.Layer] = [tf.keras.layers.RandomFlip("horizontal")]
 
     if spec.rotation > 0:
@@ -34,6 +45,10 @@ def compile_binary_model(
     learning_rate: float,
     label_smoothing: float,
 ) -> None:
+    """
+    Prepare a candidate to learn benign versus malignant labels with its chosen training
+    settings.
+    """
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
         loss=tf.keras.losses.BinaryCrossentropy(label_smoothing=label_smoothing),
@@ -46,6 +61,12 @@ def compile_binary_model(
 
 
 def build_transfer_model(config: HPOConfig, spec: TransferSearchSpec) -> tf.keras.Model:
+    """
+    Build a candidate classifier around a pretrained image model.
+
+    Keep the pretrained features fixed initially and apply the candidate's choices
+    for the new classification layers.
+    """
     inputs = tf.keras.Input(
         (config.image_size, config.image_size, 3), name="image_0_255"
     )
@@ -89,6 +110,10 @@ def build_transfer_model(config: HPOConfig, spec: TransferSearchSpec) -> tf.kera
 
 
 def enable_fine_tuning(model: tf.keras.Model, spec: TransferSearchSpec) -> None:
+    """
+    Allow selected later layers of the pretrained model to adapt using the candidate's
+    training settings.
+    """
     backbones = [
         layer
         for layer in model.layers
@@ -113,6 +138,9 @@ def enable_fine_tuning(model: tf.keras.Model, spec: TransferSearchSpec) -> None:
 def _regularized_convolution_blocks(
     features: tf.Tensor, spec: RegularizedSearchSpec, weight_regularizer
 ) -> tf.Tensor:
+    """
+    Build the image-feature layers with the candidate's size and overfitting controls.
+    """
     filters_by_block = tuple(
         min(512, spec.initial_filters * (2 ** block_index))
         for block_index in range(spec.block_count)
@@ -153,6 +181,10 @@ def _regularized_convolution_blocks(
 def build_regularized_model(
     config: Config, spec: RegularizedSearchSpec
 ) -> tf.keras.Model:
+    """
+    Build a classifier that learns from scratch using the candidate's model and training
+    choices.
+    """
     inputs = tf.keras.Input(
         (config.image_size, config.image_size, 3), name="image_0_255"
     )

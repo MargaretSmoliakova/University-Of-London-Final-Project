@@ -1,3 +1,10 @@
+"""
+Read mammogram images and inspect the DICOM files that store them.
+
+These helpers prepare pixel values, collect image details, flag possible masks,
+and identify identical files during dataset checks.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -18,6 +25,12 @@ from .common import DicomInfo
 
 
 def read_pixel_array(image_path: str | Path) -> np.ndarray:
+    """
+    Load a mammogram as a grayscale image with usable pixel values.
+
+    Apply the DICOM display adjustments when present and reject images with an
+    unsupported shape or invalid pixels.
+    """
     path = Path(image_path)
     if path.suffix.lower() == ".dcm":
         dicom = pydicom.dcmread(str(path))
@@ -37,6 +50,12 @@ def read_pixel_array(image_path: str | Path) -> np.ndarray:
 
 
 def percentile_window_to_255(pixels: np.ndarray) -> np.ndarray:
+    """
+    Bring image brightness into a common range while limiting extreme values.
+
+    This makes images with different original intensity ranges suitable for the
+    same training and visualisation steps.
+    """
     foreground = pixels[pixels > np.min(pixels)]
     source = foreground if foreground.size >= 100 else pixels.ravel()
     low, high = np.percentile(source, (1.0, 99.0))
@@ -49,6 +68,11 @@ def percentile_window_to_255(pixels: np.ndarray) -> np.ndarray:
 
 
 def sampled_unique_count(pixels: np.ndarray, maximum_samples: int = 200_000) -> int:
+    """
+    Estimate how many different pixel values an image contains.
+
+    Sampling large images keeps this check practical when looking for possible masks.
+    """
     flattened = pixels.ravel()
     if flattened.size > maximum_samples:
         stride = math.ceil(flattened.size / maximum_samples)
@@ -58,6 +82,12 @@ def sampled_unique_count(pixels: np.ndarray, maximum_samples: int = 200_000) -> 
 
 @lru_cache(maxsize=50_000)
 def inspect_dicom(path_string: str) -> DicomInfo:
+    """
+    Collect a DICOM image's dimensions and identifiers, and flag possible masks.
+
+    The result helps the image resolver choose tissue crops and supports checks
+    for duplicate images.
+    """
     path = Path(path_string)
     dicom = pydicom.dcmread(str(path), stop_before_pixels=False)
     pixels = read_pixel_array(path)
@@ -74,6 +104,7 @@ def inspect_dicom(path_string: str) -> DicomInfo:
 
 
 def file_sha256(path: str | Path) -> str:
+    """Create a fingerprint of a file's contents to detect identical image files."""
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):

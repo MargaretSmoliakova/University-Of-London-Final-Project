@@ -1,3 +1,10 @@
+"""
+Prepare and describe the computing environment used for model-setting searches.
+
+These helpers configure CPU usage and record software versions so runs can be
+reviewed alongside the environment in which they were produced.
+"""
+
 from __future__ import annotations
 
 import platform
@@ -17,6 +24,9 @@ except ImportError:
 
 
 def configure_cpu_threads(cpu_threads: int) -> None:
+    """
+    Apply the requested CPU usage settings, or let the training library choose them.
+    """
     if cpu_threads <= 0:
         LOGGER.info("TensorFlow will select CPU thread counts automatically")
 
@@ -31,6 +41,10 @@ def configure_cpu_threads(cpu_threads: int) -> None:
 
 
 def environment_summary() -> dict[str, Any]:
+    """
+    Collect system and software versions so the search's computing environment can be
+    recorded.
+    """
     return {
         "python": sys.version,
         "platform": platform.platform(),

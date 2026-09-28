@@ -1,3 +1,10 @@
+"""
+Coordinate the search for model settings from preparation to final selection.
+
+The workflow screens candidates within a time budget, confirms promising ones,
+and saves reports and selected settings for the full experiment.
+"""
+
 from __future__ import annotations
 
 import time
@@ -34,9 +41,16 @@ def _run_screening(
     search_deadline: float,
     remaining_search_seconds: float,
 ) -> None:
+    """
+    Explore candidate settings within the remaining trial count and screening time
+    budget.
+    """
     remaining_trials = max(0, hpo_config.max_trials - len(study.trials))
 
     def after_trial(study_object: Any, frozen_trial: Any) -> None:
+        """
+        Save the latest trial tables and report the study's progress after a trial ends.
+        """
         save_live_trials(
             study_object,
             hpo_config.output_dir,
@@ -89,6 +103,11 @@ def _confirm_candidates(
     preloaded: tuple[np.ndarray, np.ndarray] | None,
     total_deadline: float,
 ) -> tuple[pd.DataFrame, dict[str, Any] | None]:
+    """
+    Recheck promising settings and export a confirmed choice when the run allows it.
+
+    Save comparison results and plots to show how the candidates performed.
+    """
     candidates = confirmation_candidates(
         study, hpo_config.confirmation_top_k, hpo_config.reference_spec
     )
@@ -135,6 +154,10 @@ def _save_run_status(
     selected: dict[str, Any] | None,
     elapsed: float,
 ) -> None:
+    """
+    Record how much work finished and whether confirmed settings are ready for a full
+    experiment.
+    """
     selection_status = {}
     if hpo_config.selection_filename is not None:
         selection_status = {
@@ -159,6 +182,12 @@ def _save_run_status(
 
 
 def run_hpo(hpo_config: SearchConfig) -> None:
+    """
+    Run the complete search, from data preparation to confirmed model settings.
+
+    Divide the available time between screening and confirmation, then save the
+    results and final run status.
+    """
     run_started_wall = time.time()
     run_started_perf = time.perf_counter()
     experiment_config = hpo_config.experiment_config()

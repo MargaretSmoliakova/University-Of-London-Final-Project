@@ -1,3 +1,10 @@
+"""
+Define the search settings for a mammogram classifier trained from scratch.
+
+The candidate choices cover model size, learning behaviour, and measures intended
+to reduce overfitting. Separate training budgets support screening and confirmation.
+"""
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -30,6 +37,9 @@ SEARCH_SPACE = {
 
 @dataclass(frozen=True)
 class RegularizedSearchSpec:
+    """
+    Describe one candidate design and training setup for the regularized classifier.
+    """
     learning_rate: float = 3e-4
     l2_strength: float = 1e-4
     spatial_dropout: float = 0.10
@@ -47,6 +57,7 @@ class RegularizedSearchSpec:
     label_smoothing: float = 0.0
 
     def serialisable(self) -> dict[str, Any]:
+        """Prepare this candidate's model settings for saving and comparison."""
         return asdict(self)
 
 
@@ -55,6 +66,10 @@ REFERENCE_SPEC = RegularizedSearchSpec()
 
 @dataclass(frozen=True)
 class RegularizedHPOConfig:
+    """
+    Keep the data choices, search limits, and confirmation plan for the regularized
+    model.
+    """
     model_variant: ClassVar[str] = "regularized"
     search_space: ClassVar[dict[str, Any]] = SEARCH_SPACE
     reference_spec: ClassVar[RegularizedSearchSpec] = REFERENCE_SPEC
@@ -95,6 +110,10 @@ class RegularizedHPOConfig:
     skip_confirmation: bool = False
 
     def serialisable(self) -> dict[str, Any]:
+        """
+        Prepare the regularized model's search configuration for saving with its
+        results.
+        """
         result = asdict(self)
         result["dataset_root"] = str(self.dataset_root)
         result["output_dir"] = str(self.output_dir)
@@ -102,11 +121,16 @@ class RegularizedHPOConfig:
         return result
 
     def training_epochs(self, confirmation: bool = False) -> dict[str, int]:
+        """Choose how long to train a candidate during screening or confirmation."""
         epochs = self.confirmation_epochs if confirmation else self.screen_epochs
 
         return {"epochs": epochs}
 
     def experiment_config(self) -> Config:
+        """
+        Translate this search configuration for use by the shared experiment and data
+        helpers.
+        """
         return Config(
             dataset_root=self.dataset_root,
             output_dir=self.output_dir,

@@ -1,3 +1,10 @@
+"""
+Read and validate settings for the main mammogram experiments.
+
+The configuration brings together data locations, training choices, evaluation
+options, and previously selected model settings.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -10,6 +17,7 @@ from .hpo_selection import load_selection, selection_path, validate_hpo_settings
 
 @dataclass(frozen=True)
 class Config:
+    """Keep the data, training, and evaluation choices for one experiment run."""
     dataset_root: Path
     output_dir: Path
     program_name: str
@@ -36,6 +44,7 @@ class Config:
     hpo_selection_paths: dict[str, str] = field(default_factory=dict)
 
     def serialisable(self) -> dict[str, object]:
+        """Prepare the experiment settings for saving in a readable run record."""
         result = asdict(self)
         result["dataset_root"] = str(self.dataset_root)
         result["output_dir"] = str(self.output_dir)
@@ -43,6 +52,12 @@ class Config:
 
 
 def parse_experiment_args(program_name: str) -> Config:
+    """
+    Read command-line choices and assemble a checked experiment configuration.
+
+    Load selected model settings when needed and reject incompatible options
+    before training begins.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-root", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)

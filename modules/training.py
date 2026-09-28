@@ -1,3 +1,10 @@
+"""
+Manage data splits and training for the main model comparison.
+
+This module keeps patients separate across validation groups, reserves cases for
+threshold selection, and uses cross-validation to plan final model training.
+"""
+
 from __future__ import annotations
 
 import math
@@ -31,6 +38,9 @@ from .models import (
 
 
 def stratification_labels(metadata: pd.DataFrame) -> np.ndarray:
+    """
+    Combine lesion type and diagnosis so data splits can preserve both kinds of balance.
+    """
     return (
         metadata["lesion_type"].astype(str)
         + "_label_"
@@ -39,6 +49,7 @@ def stratification_labels(metadata: pd.DataFrame) -> np.ndarray:
 
 
 def make_cv_splitter(config: Config) -> StratifiedGroupKFold:
+    """Prepare repeatable validation folds that keep each patient's images together."""
     return StratifiedGroupKFold(
         n_splits=config.folds,
         shuffle=True,
@@ -49,6 +60,10 @@ def make_cv_splitter(config: Config) -> StratifiedGroupKFold:
 def validate_fold_integrity(
     train_fold: pd.DataFrame, validation_fold: pd.DataFrame, fold_number: int
 ) -> None:
+    """
+    Check that training and validation share no patients and both contain both diagnosis
+    classes.
+    """
     overlap = set(train_fold["patient_id"]) & set(validation_fold["patient_id"])
     if overlap:
         raise RuntimeError(f"Patient overlap in fold {fold_number}")
@@ -59,6 +74,12 @@ def validate_fold_integrity(
 def make_development_calibration_split(
     train_metadata: pd.DataFrame, config: Config
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Reserve a separate group of patients for choosing final decision thresholds.
+
+    Keep the remaining cases for model development and save the split assignments
+    so the division can be reviewed.
+    """
     approximate_splits = max(3, int(round(1.0 / config.calibration_fraction)))
     splitter = StratifiedGroupKFold(
         n_splits=approximate_splits,
@@ -106,6 +127,12 @@ def train_one_fold(
     fold_number: int,
     regularization_spec: RegularizationSpec = PRIMARY_REGULARIZATION,
 ) -> tuple[tf.keras.Model, dict[str, Any]]:
+    """
+    Train one model on a training fold and choose its best validation stage.
+
+    Return the trained model and the training schedule information needed to
+    plan the final run.
+    """
     tf.keras.backend.clear_session()
     tf.keras.utils.set_random_seed(config.seed + fold_number)
     train_dataset = make_dataset(
@@ -202,6 +229,12 @@ def cross_validate_variant(
     config: Config,
     regularization_spec: RegularizationSpec = PRIMARY_REGULARIZATION,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int | bool]]:
+    """
+    Evaluate one model across patient-separated validation folds.
+
+    Save predictions for cases held out from each fit and use the selected training
+    durations to propose a final training schedule.
+    """
     variant_dir = config.output_dir / variant
     variant_dir.mkdir(parents=True, exist_ok=True)
     oof_probability = np.full(len(train_metadata), np.nan, dtype=float)
@@ -307,6 +340,9 @@ def train_final_model(
     config: Config,
     regularization_spec: RegularizationSpec = PRIMARY_REGULARIZATION,
 ) -> tf.keras.Model:
+    """
+    Train and save a final model using the schedule chosen during cross-validation.
+    """
     tf.keras.backend.clear_session()
     tf.keras.utils.set_random_seed(config.seed + 10_000)
     dataset = make_dataset(train_metadata, config, training=True, seed_offset=10_000)
@@ -360,6 +396,10 @@ def train_final_model(
 
 
 def write_and_log_training_plan(config: Config) -> None:
+    """
+    Record the planned training stages and maximum cross-validation workload for each
+    model.
+    """
     plan: list[dict[str, Any]] = []
     for variant in config.models:
         if variant == "baseline":

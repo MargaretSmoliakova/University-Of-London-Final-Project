@@ -1,3 +1,10 @@
+"""
+Check promising search results before choosing settings for the full experiment.
+
+Candidates are trained with a larger confirmation budget, compared with the
+reference settings, and ranked using development-data performance.
+"""
+
 from __future__ import annotations
 
 import json
@@ -22,6 +29,10 @@ from .training import get_fold_trainer
 def confirmation_candidates(
     study: Any, top_k: int, reference_spec: SearchSpec = REFERENCE_SPEC
 ) -> list[tuple[str, SearchSpec]]:
+    """
+    Choose distinct top screening candidates and include the reference settings for
+    comparison.
+    """
     completed = [trial for trial in study.trials if trial.state.name == "COMPLETE"]
     ranked = sorted(
         completed,
@@ -63,6 +74,11 @@ def _run_confirmation_folds(
     confirmation_dir: Path,
     fold_rows: list[dict[str, Any]],
 ) -> tuple[np.ndarray, np.ndarray, bool]:
+    """
+    Evaluate one candidate across confirmation folds until all finish or time runs out.
+
+    Save completed fold results as training progresses.
+    """
     probabilities = np.full(len(development), np.nan, dtype=float)
     assignments = np.zeros(len(development), dtype=int)
     complete = True
@@ -116,6 +132,12 @@ def run_confirmation(
     preloaded: tuple[np.ndarray, np.ndarray] | None,
     total_deadline: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Train the shortlisted candidates with the confirmation budget.
+
+    Save fold scores and collect complete sets of held-out predictions for the
+    final comparison.
+    """
     confirmation_dir = hpo_config.output_dir / "confirmation"
     confirmation_dir.mkdir(parents=True, exist_ok=True)
     write_json(
@@ -174,6 +196,10 @@ def _rank_confirmation_candidates(
     oof: pd.DataFrame,
     confirmation_dir: Path,
 ) -> pd.DataFrame:
+    """
+    Rank fully evaluated candidates by their confirmation scores and save the comparison
+    table.
+    """
     rows: list[dict[str, Any]] = []
 
     if len(oof):
@@ -222,6 +248,7 @@ def _rank_confirmation_candidates(
 def _compare_with_reference(
     folds: pd.DataFrame, confirmation_dir: Path
 ) -> pd.DataFrame:
+    """Compare each candidate with the reference on matching validation folds."""
     comparison_rows: list[dict[str, Any]] = []
     reference = folds[folds["candidate"] == "reference"]
 
@@ -277,6 +304,10 @@ def _save_selected_parameters(
     spec_map: dict[str, SearchSpec],
     confirmation_dir: Path,
 ) -> dict[str, Any] | None:
+    """
+    Save the highest-ranked candidate and show how its settings differ from the
+    reference.
+    """
     selected: dict[str, Any] | None = None
 
     if len(summary):
@@ -323,6 +354,10 @@ def summarise_confirmation(
     candidates: list[tuple[str, SearchSpec]],
     output_dir: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any] | None]:
+    """
+    Combine confirmation rankings, reference comparisons, and the final selected
+    settings.
+    """
     confirmation_dir = output_dir / "confirmation"
     spec_map = {name: spec for name, spec in candidates}
 

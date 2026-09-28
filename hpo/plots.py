@@ -1,3 +1,10 @@
+"""
+Turn search and confirmation results into charts for review.
+
+The plots show search progress, promising trials, relationships between settings
+and scores, and how consistently candidates perform across validation groups.
+"""
+
 from __future__ import annotations
 
 import math
@@ -12,6 +19,7 @@ from .config import SEARCH_SPACE
 
 
 def _plot_optimization_history(completed: pd.DataFrame, plot_dir: Path, plt: ModuleType) -> None:
+    """Save a chart showing completed trial scores and the best score reached so far."""
     trial_numbers = completed["trial"].to_numpy(dtype=int)
     mean_ap_values = completed["objective_mean_fold_average_precision"].to_numpy(dtype=float)
 
@@ -36,6 +44,10 @@ def _plot_optimization_history(completed: pd.DataFrame, plot_dir: Path, plt: Mod
 
 
 def _plot_top_trials(completed: pd.DataFrame, plot_dir: Path, plt: ModuleType) -> None:
+    """
+    Plot the strongest screening candidates and how much their scores vary between
+    folds.
+    """
     top = completed.nlargest(min(12, len(completed)), "objective_mean_fold_average_precision")
     top = top.sort_values("objective_mean_fold_average_precision")
 
@@ -61,6 +73,10 @@ def _plot_top_trials(completed: pd.DataFrame, plot_dir: Path, plt: ModuleType) -
 
 
 def _plot_parameter_importance(importances: pd.DataFrame, plot_dir: Path, plt: ModuleType) -> None:
+    """
+    Plot available estimates of which settings matter most to the observed search
+    scores.
+    """
     if len(importances):
         shown = importances.sort_values("importance").tail(14)
         figure, axis = plt.subplots(figsize=(10, 7))
@@ -81,6 +97,10 @@ def _plot_parameter_effects(
     plt: ModuleType,
     search_space: dict[str, Any],
 ) -> None:
+    """
+    Plot each tested setting against trial performance to make patterns easier to
+    inspect.
+    """
     parameter_names = sorted(search_space)
     columns = 3
     rows = math.ceil(len(parameter_names) / columns)
@@ -129,6 +149,10 @@ def create_screen_plots(
     output_dir: Path,
     search_space: dict[str, Any] = SEARCH_SPACE,
 ) -> None:
+    """
+    Create the charts used to review screening progress, top trials, and parameter
+    effects.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -153,6 +177,10 @@ def create_screen_plots(
 def create_confirmation_plot(
     summary: pd.DataFrame, folds: pd.DataFrame, output_dir: Path
 ) -> None:
+    """
+    Plot confirmation rankings and fold-by-fold scores to compare candidate performance
+    and consistency.
+    """
     if summary.empty:
         return
 

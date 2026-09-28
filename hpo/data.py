@@ -1,3 +1,10 @@
+"""
+Prepare development images and validation groups for model-setting searches.
+
+This module audits the data, reserves calibration cases, records the search's
+data and settings, and optionally loads images into memory for repeated use.
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -25,6 +32,11 @@ def preload_images(
     experiment_config: Config,
     output_dir: Path,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Load development images once so repeated trials can reuse them from memory.
+
+    Record the loading time and memory use to help assess the cost of this option.
+    """
     started = time.perf_counter()
     LOGGER.info(
         "Preloading %d development images",
@@ -72,6 +84,7 @@ def make_array_dataset(
     training: bool,
     seed: int,
 ) -> tf.data.Dataset:
+    """Build training or validation batches from images already held in memory."""
     dataset = tf.data.Dataset.from_tensor_slices((images[indices], labels[indices]))
     options = tf.data.Options()
     options.experimental_deterministic = True
@@ -93,6 +106,9 @@ def make_fold_datasets(
     preloaded: tuple[np.ndarray, np.ndarray] | None,
     seed: int,
 ) -> tuple[tf.data.Dataset, tf.data.Dataset]:
+    """
+    Prepare a fold's training and validation batches using cached images when available.
+    """
     if preloaded is not None:
         images, labels = preloaded
 
@@ -127,6 +143,10 @@ def make_fold_datasets(
 def make_splits(
     development: pd.DataFrame, folds: int, seed: int
 ) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Divide development cases into balanced validation folds while keeping patients
+    separate.
+    """
     splitter = StratifiedGroupKFold(n_splits=folds, shuffle=True, random_state=seed)
 
     return list(
@@ -143,6 +163,10 @@ def save_fold_assignments(
     splits: Iterable[tuple[np.ndarray, np.ndarray]],
     output_path: Path,
 ) -> None:
+    """
+    Record which validation fold each case belongs to so trial comparisons can be
+    checked.
+    """
     rows: list[pd.DataFrame] = []
     base_columns = ["patient_id", "case_id", "lesion_type", "label", "image_path"]
 
@@ -155,6 +179,10 @@ def save_fold_assignments(
 
 
 def development_fingerprint(development: pd.DataFrame) -> str:
+    """
+    Create a fingerprint of the development records to detect changes when a search is
+    resumed.
+    """
     columns = ["patient_id", "case_id", "lesion_type", "label", "image_path"]
     ordered = development[columns].astype(str).sort_values(columns).reset_index(drop=True)
 
@@ -172,6 +200,12 @@ def ensure_study_contract(
     development: pd.DataFrame,
     screen_splits: list[tuple[np.ndarray, np.ndarray]],
 ) -> None:
+    """
+    Record the data and settings that define a search, or verify them against an
+    existing run.
+
+    Reject a mismatch so results from incompatible setups are not combined.
+    """
     path = hpo_config.output_dir / "study_contract.json"
     contract = {
         "study_type": hpo_config.study_type,
@@ -215,6 +249,12 @@ def prepare_hpo_data(
     list[tuple[np.ndarray, np.ndarray]],
     list[tuple[np.ndarray, np.ndarray]],
 ]:
+    """
+    Audit the dataset and prepare the development folds used by the search.
+
+    Reserve calibration cases, record fold assignments, and check that any resumed
+    study uses the same data and setup.
+    """
     LOGGER.info("Preparing and auditing dataset before HPO")
     adjusted_train, _ = prepare_and_audit_data(experiment_config)
 

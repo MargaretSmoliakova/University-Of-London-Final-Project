@@ -1,3 +1,10 @@
+"""
+Monitor training during the search for model settings.
+
+These callbacks record progress, keep training within its time budget, and allow
+unpromising trials to stop early so other settings can be explored.
+"""
+
 from __future__ import annotations
 
 import time
@@ -13,10 +20,12 @@ from .runtime import optuna
 
 
 class DeadlineReached(RuntimeError):
+    """Signal that training has reached the search or confirmation time limit."""
     pass
 
 
 class TrialControl(tf.keras.callbacks.Callback):
+    """Monitor a trial's progress and enforce its deadline and early-rejection rules."""
     def __init__(
         self,
         trial: Any | None,
@@ -25,6 +34,9 @@ class TrialControl(tf.keras.callbacks.Callback):
         allow_pruning: bool,
         minimum_epoch_before_pruning: int = 4,
     ):
+        """
+        Remember the trial, time limit, and rules for stopping an unpromising candidate.
+        """
         super().__init__()
         self.trial = trial
         self.step_offset = step_offset
@@ -33,6 +45,10 @@ class TrialControl(tf.keras.callbacks.Callback):
         self.minimum_epoch_before_pruning = minimum_epoch_before_pruning
 
     def on_epoch_end(self, epoch: int, logs: dict[str, Any] | None = None) -> None:
+        """
+        Report the latest validation score and stop if time runs out or the trial is
+        rejected.
+        """
         if time.time() >= self.deadline:
             raise DeadlineReached("Time budget reached")
         if self.trial is None:
@@ -65,6 +81,10 @@ def training_callbacks(
     step_offset: int,
     allow_pruning: bool,
 ) -> list[tf.keras.callbacks.Callback]:
+    """
+    Set up logging, learning adjustments, early stopping, and budget checks for a search
+    stage.
+    """
     stage_dir.mkdir(parents=True, exist_ok=True)
 
     return [
@@ -94,6 +114,10 @@ def training_callbacks(
 
 
 def best_history_epoch(history: tf.keras.callbacks.History) -> tuple[int, float]:
+    """
+    Find the strongest recorded validation epoch, or mark the result unavailable if none
+    is usable.
+    """
     values = np.asarray(history.history.get("val_pr_auc", []), dtype=float)
     if not len(values) or not np.isfinite(values).any():
         return 0, float("nan")

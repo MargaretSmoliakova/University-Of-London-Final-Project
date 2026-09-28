@@ -1,3 +1,10 @@
+"""
+Organise and interpret the results of model-setting searches.
+
+This module saves trial rankings, summarises observed relationships between
+settings and performance, and creates reports for reviewing the search.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -18,6 +25,9 @@ def trial_table(
     search_space: dict[str, Any] = SEARCH_SPACE,
     trial_attributes: tuple[str, ...] = (),
 ) -> pd.DataFrame:
+    """
+    Collect trial settings, scores, timings, and outcomes into one table for review.
+    """
     parameter_names = sorted(search_space)
 
     rows: list[dict[str, Any]] = []
@@ -61,6 +71,10 @@ def save_live_trials(
     search_space: dict[str, Any] = SEARCH_SPACE,
     trial_attributes: tuple[str, ...] = (),
 ) -> None:
+    """
+    Refresh the saved trial tables so search progress and current rankings can be
+    inspected.
+    """
     table = trial_table(study, search_space, trial_attributes)
     table.to_csv(output_dir / "all_trials.csv", index=False)
 
@@ -80,6 +94,12 @@ def calculate_parameter_effects(
     completed: pd.DataFrame,
     search_space: dict[str, Any] = SEARCH_SPACE,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Summarise how tested parameter values relate to completed trials' scores.
+
+    Group values into useful ranges where needed and measure trends for numerical
+    settings to help interpret the search.
+    """
     effect_rows: list[dict[str, Any]] = []
     correlation_rows: list[dict[str, Any]] = []
     objective = "objective_mean_fold_average_precision"
@@ -135,6 +155,12 @@ def calculate_parameter_effects(
 def summarise_parameter_effects(
     effects: pd.DataFrame, importances: pd.DataFrame
 ) -> pd.DataFrame:
+    """
+    Highlight the best and worst observed settings for each parameter.
+
+    Combine their score differences with available importance estimates to guide
+    review of the search results.
+    """
     if effects.empty:
         return pd.DataFrame()
 
@@ -171,6 +197,12 @@ def summarise_parameter_effects(
 
 
 def parameter_importance_table(study: Any) -> pd.DataFrame:
+    """
+    Estimate which settings are most associated with score differences across completed
+    trials.
+
+    Return an empty report if there are too few results or the estimate cannot be made.
+    """
     completed = [trial for trial in study.trials if trial.state.name == "COMPLETE"]
     if len(completed) < 3:
         return pd.DataFrame(columns=["parameter", "importance"])
@@ -193,6 +225,10 @@ def save_screen_analysis(
     search_space: dict[str, Any] = SEARCH_SPACE,
     trial_attributes: tuple[str, ...] = (),
 ) -> dict[str, pd.DataFrame]:
+    """
+    Save screening rankings, parameter summaries, charts, and the best completed
+    candidate.
+    """
     save_live_trials(study, output_dir, search_space, trial_attributes)
     trials = trial_table(study, search_space, trial_attributes)
     completed = trials[trials["state"] == "COMPLETE"].copy()
@@ -246,6 +282,10 @@ def save_screen_analysis(
 
 
 def regularized_fold_summary(folds: pd.DataFrame) -> dict[str, float | int]:
+    """
+    Summarise training duration, selected epochs, and model size when regularized-model
+    results are available.
+    """
     if "selected_epoch" not in folds:
         return {}
 
